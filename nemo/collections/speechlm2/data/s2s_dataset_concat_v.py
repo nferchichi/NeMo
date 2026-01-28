@@ -56,6 +56,10 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
         output_roles (list[str], optional):
             List of speaker roles (cut.supervisions[:].speaker) to consider as outputs. Defaults to ["agent"].
 
+        force_align_user_text (bool, optional):
+            If True, performs force alignment on user audio segments to generate word-level timestamps.
+            Only applies to supervision turns where speaker.role is "user". Defaults to False.
+
     Returns:
         A dictionary with the following keys:
             - source_audio: Tensor of source waveform samples [B, T]
@@ -79,6 +83,9 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
         - Text tokens from each speaker are placed at frame positions corresponding to their
           timestamp in the original recording, preserving the temporal relationship.
           This is a segment-level alignment only, not word-level alignment.
+        - When force_align_user_text is enabled, user audio segments are
+          force-aligned using wav2vec2 to generate word-level timestamps, which are then
+          converted to frame-level token positions for more precise alignment.
     """
 
     def __init__(
@@ -89,6 +96,10 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
         target_sample_rate: int,
         input_roles: list[str] = None,
         output_roles: list[str] = None,
+        word_align_position: str = 'left',
+        predict_user_text: bool = False,
+        model_cfg: dict = None,
+        force_align_device: str = None,
     ):
         self.tokenizer = tokenizer
         self.frame_length = frame_length
@@ -96,7 +107,18 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
         self.target_sample_rate = target_sample_rate
         self.input_roles = set(ifnone(input_roles, ["user"]))
         self.output_roles = set(ifnone(output_roles, ["agent"]))
-        
+        self.word_align_position = word_align_position
+        self.predict_user_text = predict_user_text
+        self.model_cfg = model_cfg
+        self.force_align_user_text = self.model_cfg.get("force_align_user_text", False) if self.model_cfg is not None else None
+        self.force_align_asr_model_path = self.model_cfg.get("force_align_asr_model_path", None) if self.model_cfg is not None else None
+        self.force_align_device = force_align_device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Initialize force aligner if needed
+        self.force_aligner = None
+        if self.force_align_user_text:
+            self.force_aligner = ForceAligner(device=self.force_align_device, frame_length=self.frame_length)
+
         assert tokenizer.bos is not None, "BOS support in the tokenizer is required for S2S models."
         assert tokenizer.eos is not None, "EOS support in the tokenizer is required for S2S models."
 
@@ -115,6 +137,10 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
             
         target_tokens, target_token_lens = collate_token_channel(
                                             cuts, self.tokenizer, self.frame_length, roles=self.output_roles)
+
+        # if self.force_align_user_text:
+        #     self.force_aligner.batch_force_align_user_audio(cuts, source_sample_rate=self.source_sample_rate)
+
         source_tokens, source_token_lens = collate_token_channel(
             cuts, self.tokenizer, self.frame_length, roles=self.input_roles
         )
@@ -137,8 +163,14 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
             "target_token_lens": target_token_lens,
             "source_tokens": source_tokens,
             "source_token_lens": source_token_lens,
+            "source_texts": [
+                " ".join(s.text for s in cut.supervisions if s.speaker in self.input_roles) for cut in cuts
+            ],
             "target_texts": [
                 " ".join(s.text for s in cut.supervisions if s.speaker in self.output_roles) for cut in cuts
+            ],
+            "all_texts": [
+                " ".join(s.text for s in cut.supervisions) for cut in cuts
             ],
             "first_turn_audio": first_turn_audio,
             "first_turn_audio_lens": first_turn_audio_lens,
@@ -203,6 +235,7 @@ def build_token_channel(
     diagnostic = f"Extra info: {cut.id=}"
     if getattr(cut, "shard_origin", None) is not None:
         diagnostic = f"{diagnostic} {cut.shard_origin=}"
+
     total = compute_num_frames(cut.duration, frame_length, cut.sampling_rate)
     tokens = torch.ones(total, dtype=torch.long) * pad_id
     count = 0
