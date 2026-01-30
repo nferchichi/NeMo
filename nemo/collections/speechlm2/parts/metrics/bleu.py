@@ -44,11 +44,15 @@ class BLEU:
 
     def update(self, name: str, refs: list[str], hyps: list[str]) -> None:
         for ref, hyp in zip(refs, hyps):
-            self._refs[name].append(self.normalizer(ref))
-            self._hyps[name].append(self.normalizer(hyp))
+            normalized_ref = self.normalizer(ref)
+            normalized_hyp = self.normalizer(hyp)
+            
+            self._refs[name].append(normalized_ref)
+            self._hyps[name].append(normalized_hyp)
+
             if self.verbose:
-                asrb = sacrebleu.sentence_bleu(hyp, [ref]).score
-                logging.info(f"[REF]\t{ref}\n[HYP]\t{hyp} [{asrb:.2f}]")
+                asrb = sacrebleu.sentence_bleu(normalized_ref, [normalized_hyp]).score
+                logging.info(f"[REF]\t{normalized_ref}\n[HYP]\t{normalized_hyp} [{asrb:.2f}]")
 
     def compute(self) -> dict[str, torch.Tensor]:
         corpus_metric = {}
@@ -63,3 +67,4 @@ class BLEU:
 
 def _identity(x):
     return x
+

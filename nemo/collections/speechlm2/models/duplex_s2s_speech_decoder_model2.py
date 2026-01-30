@@ -173,13 +173,12 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
         llm = load_pretrained_hf(self.cfg.pretrained_llm, pretrained_weights=self.cfg.pretrained_weights).train()
         self.llm = llm.model  # fetch PretrainedBaseModel from model "ForCausalLM"
         self.lm_head = llm.lm_head
-        if self.cfg.get("use_separate_asr_head", False):
-            self.asr_head = copy.deepcopy(self.lm_head)
-
         # Note: we have to "move out" the token embedding outside of LLM to avoid
         #       messing up FSDP/TP hooks.
-        self.embed_tokens = self.llm.embed_tokens
-        if self.cfg.get("use_separate_asr_head", False):
+        self.embed_tokens = self.llm.embed_tokens            
+
+        if self.cfg.get("predict_user_text", False):
+            self.asr_head = copy.deepcopy(self.lm_head)
             self.embed_asr_tokens = copy.deepcopy(self.embed_tokens)
 
         del self.llm.embed_tokens
@@ -363,7 +362,7 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
         )
         B, T = input_embeds.shape[:2]
         text_logits = self.lm_head(out['last_hidden_state'])  # (B, T, text_vocab_size)
-        if self.cfg.get("use_separate_asr_head", False):
+        if self.cfg.get("predict_user_text", False):
             asr_logits = self.asr_head(out['last_hidden_state'])  # (B, T, asr_vocab_size)
 
         if seq_mask is not None:
@@ -382,10 +381,7 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             if self.cfg.get("inference_eos_boost", None):
                 text_logits[:, :, self.text_eos_id] += self.cfg.inference_eos_boost
 
-            if self.cfg.get("use_separate_asr_head", False) and not self.cfg.get("is_conv", False):
-                target_text_tokens = torch.argmax(asr_logits, dim=-1).view(B, T).contiguous()
-            else:
-                target_text_tokens = torch.argmax(text_logits, dim=-1).view(B, T).contiguous()
+            target_text_tokens = torch.argmax(text_logits, dim=-1).view(B, T).contiguous()
 
             if self.cfg.get('convert_pad_to_extra_id_on_speech_decoder', None):
                 target_text_tokens[target_text_tokens == self.text_pad_id] = self.tokenizer.tokenizer._tokenizer.token_to_id("<|endoftext|>") # <|endoftext|> token id
@@ -421,7 +417,7 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             "text_logits": text_logits,
             "audio_logits": audio_logits,
         }
-        if self.cfg.get("use_separate_asr_head", False):
+        if self.cfg.get("predict_user_text", False):
             ans["asr_logits"] = asr_logits
 
         if cache is not None:
@@ -1348,7 +1344,7 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             if not self.cfg.get("force_use_asr_head_for_user_agent_text", False):
                 last_emb = self.embed_tokens(gen_text[:, t - 1]) * self.cfg.get("duplex_text_channel_weight", 1.0)
             if self.cfg.get("use_separate_asr_head", False):
-                last_asr_emb = self.embed_asr_tokens(gen_text[:, t - 1])
+                last_asr_emb = self.embed_asr_tokens(gen_asr[:, t - 1])
                 last_emb += last_asr_emb * self.cfg.get("duplex_asr_text_weight", 1.0)
             input_embeds[:, t] += last_emb
 

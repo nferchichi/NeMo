@@ -114,10 +114,10 @@ class ResultsLogger:
 
             # cache metadata
             out_dict = {
-                "target_text": refs[i],
-                "pred_text": hyps[i],
+                "target_text_ref": refs[i],
+                "pred_target_text": hyps[i],
                 # "speech_pred_transcribed": asr_hyps[i],
-                "src_text": src_refs[i],
+                "src_text_ref": src_refs[i],
                 "pred_src_text": src_hyps[i] if src_hyps is not None and src_hyps[i] is not None else "",
                 "all_text": all_refs[i],
                 "pred_all_text": all_hyps[i],                

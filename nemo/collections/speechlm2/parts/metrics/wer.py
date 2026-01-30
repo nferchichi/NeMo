@@ -59,7 +59,7 @@ class WER:
             else:
                 if self.verbose:
                     wer_score = jiwer.wer(normalized_ref, normalized_hyp)
-                    logging.info(f"[REF]\t{normalized_ref}\n[HYP]\t{normalized_hyp} [WER: {wer_score:.4f}]")
+                    logging.info(f"[USER_REF]\t{normalized_ref}\n[USER_ASR_HYP]\t{normalized_hyp} [WER: {wer_score:.4f}]")
 
     def compute(self) -> dict[str, torch.Tensor]:
         corpus_metric = {}
