@@ -57,11 +57,23 @@ from nemo.collections.speechlm2.parts.pretrained import (
     set_model_dict_for_partial_init,
     setup_audio_codec,
     setup_speech_encoder,
+    setup_rnnt_decoder_joint,
 )
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.utils import logging
 
 
+def _get_rnnt_decoding_module():
+    """Lazy import for RNNTDecoding and RNNTBPEDecoding (same stack as speech_to_text_streaming_infer)."""
+    from nemo.collections.asr.parts.submodules.rnnt_decoding import (
+        RNNTDecoding,
+        RNNTDecodingConfig,
+        RNNTBPEDecoding,
+        RNNTBPEDecodingConfig,
+    )
+    return RNNTDecoding, RNNTDecodingConfig, RNNTBPEDecoding, RNNTBPEDecodingConfig
+
+    
 def delay_eos(tokens, eos_token_id, pad_token_id, shift=10):
     """
     Delays each EOS token by `shift` steps forward. Replaces original EOS with PAD.
@@ -177,7 +189,7 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
         #       messing up FSDP/TP hooks.
         self.embed_tokens = self.llm.embed_tokens            
 
-        if self.cfg.get("predict_user_text", False):
+        if self.cfg.get("predict_user_text", False) or self.cfg.get("use_separate_asr_head", False):
             self.asr_head = copy.deepcopy(self.lm_head)
             self.embed_asr_tokens = copy.deepcopy(self.embed_tokens)
 
@@ -186,6 +198,8 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
 
         # Load the pretrained streaming ASR model and copy its parameters into the audio perception module.
         setup_speech_encoder(self)
+        # Optionally load RNNT decoder and joint (set pretrained_rnnt_asr in config)
+        setup_rnnt_decoder_joint(self)
 
         llm_tokenizer_vocab_items = self.tokenizer.vocab
         # if vocab is a dict it already has the subword and token id, if not, get it from the tokenizer
@@ -362,7 +376,7 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
         )
         B, T = input_embeds.shape[:2]
         text_logits = self.lm_head(out['last_hidden_state'])  # (B, T, text_vocab_size)
-        if self.cfg.get("predict_user_text", False):
+        if self.cfg.get("predict_user_text", False) or self.cfg.get("use_separate_asr_head", False):
             asr_logits = self.asr_head(out['last_hidden_state'])  # (B, T, asr_vocab_size)
 
         if seq_mask is not None:
@@ -417,7 +431,7 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             "text_logits": text_logits,
             "audio_logits": audio_logits,
         }
-        if self.cfg.get("predict_user_text", False):
+        if self.cfg.get("predict_user_text", False) or self.cfg.get("use_separate_asr_head", False):
             ans["asr_logits"] = asr_logits
 
         if cache is not None:
@@ -1104,31 +1118,36 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             self.empty_user_text = EmptyTextMetric().reset()
 
     def on_validation_epoch_end(self, prefix="val") -> None:
+        # logger=True: send epoch validation scalars to WandB/NeMo loggers (not only progress bar).
+        # Val dataloaders use full data on every rank (see DataModule) so each rank logs the same
+        # metric keys; sync_dist then matches PL expectations (avoids silent drops, PL #21409).
+        _log_kw = dict(on_epoch=True, sync_dist=True, logger=True, prog_bar=False)
+
         asr_bleu = self.asr_bleu.compute()
         for k, m in asr_bleu.items():
-            self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+            self.log(f"{prefix}_{k}", m.to(self.device), **_log_kw)
         bleu = self.bleu.compute()
         for k, m in bleu.items():
-            self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+            self.log(f"{prefix}_{k}", m.to(self.device), **_log_kw)
         text_bos_acc = self.text_bos_acc.compute()
         for k, m in text_bos_acc.items():
-            self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+            self.log(f"{prefix}_{k}", m.to(self.device), **_log_kw)
         text_eos_acc = self.text_eos_acc.compute()
         for k, m in text_eos_acc.items():
-            self.log(f"{prefix}_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+            self.log(f"{prefix}_{k}", m.to(self.device), **_log_kw)
         if self.predict_user_text:
             src_bleu = self.src_bleu.compute()
             for k, m in src_bleu.items():
-                self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+                self.log(f"{prefix}_src_{k}", m.to(self.device), **_log_kw)
             src_text_bos_acc = self.src_text_bos_acc.compute()
             for k, m in src_text_bos_acc.items():
-                self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+                self.log(f"{prefix}_src_{k}", m.to(self.device), **_log_kw)
             src_wer = self.src_wer.compute()
             for k, m in src_wer.items():
-                self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+                self.log(f"{prefix}_src_{k}", m.to(self.device), **_log_kw)
             empty_user_text = self.empty_user_text.compute()
             for k, m in empty_user_text.items():
-                self.log(f"{prefix}_src_{k}", m.to(self.device), on_epoch=True, sync_dist=True)
+                self.log(f"{prefix}_src_{k}", m.to(self.device), **_log_kw)
 
     def validation_step(self, batch: dict, batch_idx: int):
 
@@ -1136,8 +1155,9 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
         if self.speech_generation.use_speaker_encoder and self.use_random_spk_emb:
             self.speech_generation.update_inference_speaker_embedding(
                 self.speech_generation.inference_speaker_reference
-            ) 
+            )
 
+        speaker_encoder_emb = None
         for name, dataset_batch in batch.items():
             if dataset_batch is None:
                 continue  # some dataset is exhausted
@@ -1168,6 +1188,8 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
                     hyps=results["text"],
                     src_refs=dataset_batch["source_texts"],
                     src_hyps=results["src_text"],
+                    src_hyps_asr_head=results.get("src_text_asr_head"),
+                    src_hyps_rnnt=results.get("src_text_rnnt"),
                     all_refs=dataset_batch["all_texts"],
                     all_hyps=results["all_text"],
                     asr_hyps=asr_hyps,
@@ -1215,6 +1237,93 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
         text_bos = torch.full((1,), fill_value=self.text_pad_id, device=self.device)
         input_embeds = self.embed_asr_tokens(text_bos)
         return input_embeds
+
+    def _get_rnnt_decoding(self):
+        """Lazy-build and cache NeMo RNNT decoding. Uses strategy 'greedy' for streaming (partial_hypotheses)."""
+        if getattr(self, "_rnnt_decoding", None) is not None:
+            return self._rnnt_decoding
+        if getattr(self, "rnnt_decoder", None) is None or getattr(self, "rnnt_joint", None) is None:
+            return None
+        strategy = "greedy"
+        (
+            RNNTDecoding,
+            RNNTDecodingConfig,
+            RNNTBPEDecoding,
+            RNNTBPEDecodingConfig,
+        ) = _get_rnnt_decoding_module()
+        decoding_cfg = OmegaConf.structured(RNNTBPEDecodingConfig())
+        decoding_cfg.strategy = strategy
+        decoding_cfg.greedy.max_symbols_per_step = self.cfg.get("rnnt_max_symbols_per_step", 10)
+        tokenizer = getattr(self, "rnnt_tokenizer", None)
+        if tokenizer is not None:
+            self._rnnt_decoding = RNNTBPEDecoding(
+                decoding_cfg=decoding_cfg,
+                decoder=self.rnnt_decoder,
+                joint=self.rnnt_joint,
+                tokenizer=tokenizer,
+            )
+            logging.info(
+                "Using RNNTBPEDecoding with ASR tokenizer (ids_to_text), strategy=%s (streaming).",
+                strategy,
+            )
+        else:
+            vocab = getattr(self.rnnt_joint, "vocabulary", None)
+            if vocab is None:
+                logging.warning("rnnt_joint has no vocabulary; cannot build RNNT decoding.")
+                return None
+            decoding_cfg_v = OmegaConf.structured(RNNTDecodingConfig())
+            decoding_cfg_v.strategy = strategy
+            decoding_cfg_v.greedy.max_symbols_per_step = self.cfg.get("rnnt_max_symbols_per_step", 10)
+            self._rnnt_decoding = RNNTDecoding(
+                decoding_cfg=decoding_cfg_v,
+                decoder=self.rnnt_decoder,
+                joint=self.rnnt_joint,
+                vocabulary=list(vocab),
+            )
+            logging.info(
+                "Using RNNTDecoding with vocabulary (no tokenizer); strategy=%s (streaming); "
+                "▁ normalized in _rnnt_hypotheses_to_src_text.",
+                strategy,
+            )
+        return self._rnnt_decoding
+
+    def _run_rnnt_decode_one_step(
+        self,
+        asr_emb_slice: torch.Tensor,
+        encoded_lengths: torch.Tensor,
+        previous_hypotheses: list,
+    ) -> list:
+        """
+        Run RNNT decoding on a single encoder frame (one asr_emb position), same cadence as asr_head in the loop.
+        asr_emb_slice: (B, 1, D); encoded_lengths: (B,) 0 or 1 per batch item.
+        Returns updated list of Hypothesis (one per batch item).
+        """
+        decoding = self._get_rnnt_decoding()
+        if decoding is None:
+            return previous_hypotheses if previous_hypotheses is not None else []
+        if encoded_lengths.max().item() <= 0:
+            return previous_hypotheses if previous_hypotheses is not None else []
+        encoder_output_bdt = asr_emb_slice.transpose(1, 2)  # (B, D, 1)
+        with torch.inference_mode():
+            hypotheses = decoding.rnnt_decoder_predictions_tensor(
+                encoder_output=encoder_output_bdt,
+                encoded_lengths=encoded_lengths,
+                return_hypotheses=True,
+                partial_hypotheses=previous_hypotheses,
+            )
+        return hypotheses if hypotheses is not None else (previous_hypotheses or [])
+
+    def _rnnt_hypotheses_to_src_text(self, hypotheses: list) -> list:
+        """Convert RNNT hypotheses to transcript strings. Normalize ▁ (U+2581) to space."""
+        import re
+        texts = []
+        for hyp in hypotheses:
+            raw = str(getattr(hyp, "text", "") or "").strip()
+            raw = raw.replace("\u2581", " ")
+            raw = re.sub(r" +", " ", raw).strip()
+            raw = re.sub(r"(\s+)([.,?])", r"\2", raw)
+            texts.append(raw)
+        return texts
 
     @torch.no_grad()
     def offline_inference(
@@ -1298,14 +1407,28 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
         input_embeds = source_encoded.clone()
         input_embeds *= self.cfg.get("duplex_user_channel_weight", 1.0)
 
+        def _asr_branch_decode_enabled() -> bool:
+            v = self.cfg.get("asr_branch_decode", False)
+            if isinstance(v, str):
+                return v.strip().lower() in ("true", "1", "yes")
+            return bool(v)
+
+        rnnt_decoding = self._get_rnnt_decoding()
+        do_rnnt_in_loop = _asr_branch_decode_enabled() and self.predict_user_text and rnnt_decoding is not None
+        rnnt_partial_hypotheses = None
+
         # This cache is for self.llm
         cache = DynamicCache()
         # Call reset_input_and_kv_cache to enable cache for TransformerARSpeechDecoder
         self.speech_generation.reset_input_and_kv_cache(use_cache=True)
-        gen_text = torch.empty(B, T, device=self.device, dtype=torch.long)
-        gen_audio = torch.empty(B, T, self._num_codebooks, device=self.device, dtype=torch.long)
-        if self.cfg.get("use_separate_asr_head", False):
-            gen_asr = torch.empty(B, T, device=self.device, dtype=torch.long)
+        # Pad-initialize so early-stop / length slices never read torch.empty garbage.
+        gen_text = torch.full((B, T), self.text_pad_id, device=self.device, dtype=torch.long)
+        gen_audio = torch.full(
+            (B, T, self._num_codebooks), self.speech_delay_id, device=self.device, dtype=torch.long
+        )
+        track_asr_logits = self.predict_user_text or self.cfg.get("use_separate_asr_head", False)
+        if track_asr_logits:
+            gen_asr = torch.full((B, T), self.text_pad_id, device=self.device, dtype=torch.long)
 
         # First step, use speech_delay token, same as in training
         if not self.cfg.get("force_use_asr_head_for_user_agent_text", False):
@@ -1330,14 +1453,33 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
         )
         gen_text[:, 0] = ans["text_logits"][:, -1].argmax(dim=-1)
         gen_audio[:, 0] = ans["audio_logits"][:, -1].argmax(dim=-1)
-        if self.cfg.get("use_separate_asr_head", False):
+        if track_asr_logits:
             gen_asr[:, 0] = ans["asr_logits"][:, -1].argmax(dim=-1)
+
+        if do_rnnt_in_loop and asr_emb.shape[1] > 0:
+            enc_step = (lengths.to(asr_emb.device) > 0).long()
+            rnnt_partial_hypotheses = self._run_rnnt_decode_one_step(
+                asr_emb[:, 0:1, :], enc_step, rnnt_partial_hypotheses
+            )
 
         speech_state = torch.zeros(B, device=self.device, dtype=torch.long)
         gen_audio_len = torch.full((B,), T, device=self.device, dtype=input_signal_lens.dtype)
         gen_text_len = torch.full((B,), T, device=self.device, dtype=input_signal_lens.dtype)
+        if track_asr_logits:
+            gen_asr_len = torch.zeros(B, dtype=torch.long, device=self.device)
+
         audio_done = torch.zeros(B, dtype=torch.bool, device=self.device)
         txt_done = torch.zeros(B, dtype=torch.bool, device=self.device)
+        # Agent EOS on frame 0 is never checked inside the t>=1 loop.
+        eos0 = gen_text[:, 0] == self.text_eos_id
+        if eos0.any():
+            txt_done = txt_done | eos0
+            gen_text_len = torch.where(eos0, torch.ones_like(gen_text_len), gen_text_len)
+        asr_accum = (
+            torch.zeros(B, dtype=torch.bool, device=self.device)
+            if track_asr_logits
+            else torch.ones(B, dtype=torch.bool, device=self.device)
+        )
 
         # Autoregressive loop
         for t in range(1, T):
@@ -1361,8 +1503,14 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             )
             gen_text[:, t] = ans["text_logits"][:, -1].argmax(dim=-1)
             gen_audio[:, t] = ans["audio_logits"][:, -1].argmax(dim=-1)
-            if self.cfg.get("use_separate_asr_head", False):
+            if track_asr_logits:
                 gen_asr[:, t] = ans["asr_logits"][:, -1].argmax(dim=-1)
+
+            if do_rnnt_in_loop and t < asr_emb.shape[1]:
+                enc_step = (lengths.to(asr_emb.device) > t).long()
+                rnnt_partial_hypotheses = self._run_rnnt_decode_one_step(
+                    asr_emb[:, t : t + 1, :], enc_step, rnnt_partial_hypotheses
+                )
             
             if self.cfg.get('inference_force_speech_state', None):
                 # state 0 - silence, state 1 - speech
@@ -1404,29 +1552,75 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             # --- EOS tracking ---
             speech_done = (gen_audio[:, t] == self.speech_eos_id).any(dim=1)
             text_done = (gen_text[:, t] == self.text_eos_id)
+            asr_step_done = (
+                (gen_asr[:, t] == self.user_eos_id)
+                if track_asr_logits
+                else torch.zeros(B, dtype=torch.bool, device=self.device)
+            )
+
             newly_speech_done = (~audio_done) & (speech_done)
             newly_text_done = (~txt_done) & (text_done)
+            newly_asr_done = (~asr_accum) & (asr_step_done)
+
             gen_audio_len[newly_speech_done] = t + 1
             gen_text_len[newly_text_done] = t + 1
+            if track_asr_logits:
+                gen_asr_len[newly_asr_done] = t + 1
+
             audio_done |= newly_speech_done
             txt_done |= newly_text_done
-            if audio_done.all() and txt_done.all():
+            asr_accum |= newly_asr_done
+
+            if audio_done.all() and txt_done.all() and asr_accum.all():
                 break
 
         # Trim back to local length if padded
         if self._use_fsdp and T > T_local:
             gen_text = gen_text[:, :T_local]
             gen_audio = gen_audio[:, :T_local]
-        if self.cfg.get("use_separate_asr_head", False):
+        if track_asr_logits:
             gen_asr = gen_asr[:, :T_local]
+
+        # Decode user/ASR-head stream with lengths tied to user_eos (or trailing non-pad), not agent gen_text_len.
+        if track_asr_logits:
+            asr_lens_for_decode = gen_asr_len.clone()
+            max_t = int(gen_asr.size(1))
+            for b in range(B):
+                if asr_lens_for_decode[b] > 0:
+                    continue
+                hits = (gen_asr[b] == self.user_eos_id).nonzero(as_tuple=True)[0]
+                if hits.numel() > 0:
+                    asr_lens_for_decode[b] = int(hits[0].item()) + 1
+                    continue
+                nz = (gen_asr[b] != self.text_pad_id).nonzero(as_tuple=True)[0]
+                if nz.numel() > 0:
+                    asr_lens_for_decode[b] = min(int(nz[-1].item()) + 1, max_t)
+        else:
+            asr_lens_for_decode = None
 
         all_text = gen_text.clone()
         if self.predict_user_text:
             gen_text_src = gen_asr
-            src_text_cleaned = [self.tokenizer.ids_to_text(gen_text_src[b]) for b in range(gen_text_src.shape[0])]
+            # src_text_cleaned = [self.tokenizer.ids_to_text(gen_text_src[b]) for b in range(gen_text_src.shape[0])]
         else:
             gen_text_src = None
-            src_text_cleaned = None
+            # src_text_cleaned = None
+
+        src_text_asr_head = None
+        src_text_rnnt = None
+        src_text_out = None
+        if self.predict_user_text and gen_text_src is not None:
+            src_text_asr_head = tokens_to_str(
+                gen_text_src,
+                asr_lens_for_decode,
+                tokenizer=self.tokenizer,
+                pad_id=self.text_pad_id,
+            )
+            if do_rnnt_in_loop and rnnt_partial_hypotheses is not None:
+                src_text_rnnt = self._rnnt_hypotheses_to_src_text(rnnt_partial_hypotheses)
+                src_text_out = src_text_rnnt
+            else:
+                src_text_out = src_text_asr_head
 
         # ans = {
         #     "text": tokens_to_str(gen_text, lengths, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
@@ -1435,15 +1629,22 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
         #     "tokens_len": lengths,
         # }
         # breakpoint()
+        _rm_spec = not self.cfg.get("val_decode_keep_special_tokens", False)
         ans = {
-            "text": tokens_to_str(gen_text, gen_text_len, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
-            "src_text": src_text_cleaned if self.predict_user_text else None,
-            "all_text": tokens_to_str(all_text, gen_text_len, tokenizer=self.tokenizer, pad_id=self.text_pad_id),
+            "text": tokens_to_str(
+                gen_text, gen_text_len, tokenizer=self.tokenizer, pad_id=self.text_pad_id, remove_special_tokens=_rm_spec
+            ),
+            "src_text": src_text_out if self.predict_user_text else None,
+            "all_text": tokens_to_str(
+                all_text, gen_text_len, tokenizer=self.tokenizer, pad_id=self.text_pad_id, remove_special_tokens=_rm_spec
+            ),
             "tokens_text_src": gen_text_src if self.predict_user_text else None,
             "tokens_text": gen_text,
             "tokens_audio": gen_audio,
             "tokens_len": dataset_batch["decode_source_audio_lens"],
         }
+        ans["src_text_asr_head"] = src_text_asr_head
+        ans["src_text_rnnt"] = src_text_rnnt
 
         if decode_audio:
             gen_audio_codes = replace_control_speech_codes(gen_audio, self._control_codes)
@@ -1550,7 +1751,10 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
 
                 parallelize_module(transformer_block, tp_mesh, plan)
 
-            for m in (self.lm_head, self.audio_head):
+            _tp_heads = [self.lm_head, self.audio_head]
+            if getattr(self, "asr_head", None) is not None:
+                _tp_heads.append(self.asr_head)
+            for m in _tp_heads:
                 parallelize_module(
                     m,
                     tp_mesh,

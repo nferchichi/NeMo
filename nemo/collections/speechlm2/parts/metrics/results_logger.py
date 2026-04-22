@@ -90,6 +90,8 @@ class ResultsLogger:
         fps: float = None,
         results=None,
         tokenizer=None,
+        src_hyps_asr_head: list[str] | None = None,
+        src_hyps_rnnt: list[str] | None = None,
     ) -> None:
 
         out_json_path = os.path.join(self.matadata_save_path, f"{name}.json")
@@ -112,17 +114,36 @@ class ResultsLogger:
                 eou_pred_wav = eou_pred_wav.float() * 0.8  #  make 1 audible and keep 0 as total silence
                 torchaudio.save(out_audio_path_eou, eou_pred_wav.squeeze().unsqueeze(0).detach().cpu(), pred_audio_sr)
 
-            # cache metadata
+            # cache metadata (user ASR: align with DuplexSTT / results_logger reference)
+            pred_src = src_hyps[i] if src_hyps is not None and i < len(src_hyps) and src_hyps[i] is not None else ""
+            pred_src_asr_head = (
+                src_hyps_asr_head[i]
+                if src_hyps_asr_head is not None and i < len(src_hyps_asr_head) and src_hyps_asr_head[i] is not None
+                else ""
+            )
+            pred_src_rnnt = (
+                src_hyps_rnnt[i]
+                if src_hyps_rnnt is not None and i < len(src_hyps_rnnt) and src_hyps_rnnt[i] is not None
+                else ""
+            )
             out_dict = {
                 "target_text_ref": refs[i],
                 "pred_target_text": hyps[i],
                 # "speech_pred_transcribed": asr_hyps[i],
                 "src_text_ref": src_refs[i],
-                "pred_src_text": src_hyps[i] if src_hyps is not None and src_hyps[i] is not None else "",
-                "all_text": all_refs[i],
-                "pred_all_text": all_hyps[i],                
+                "asr_pred_text_rnnt": pred_src_rnnt,
+                # "pred_src_text": pred_src,
+                # "all_text": all_refs[i],
+                # "pred_all_text": all_hyps[i],                
                 "audio_path": os.path.relpath(out_audio_path, self.save_path),
+                # "asr_pred_text": pred_src,
+                # "asr_pred_text_asr_head": pred_src_asr_head,
+                # "pred_src_text_asr_head": pred_src_asr_head,
             }
+            if pred_src_asr_head:
+                logging.info(f"[ASR head] Sample {sample_id}: {pred_src_asr_head}")
+            if pred_src_rnnt:
+                logging.info(f"[ASR RNNT] Sample {sample_id}: {pred_src_rnnt}")
             if results is not None:
                 if tokenizer is not None:
                     out_dict['tokens_text'] = " ".join(tokenizer.ids_to_tokens(results['tokens_text'][i]))

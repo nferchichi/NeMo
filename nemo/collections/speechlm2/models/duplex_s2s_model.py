@@ -616,10 +616,27 @@ def replace_control_speech_codes(speech_codes: torch.Tensor, control_codes: torc
     return torch.where(torch.isin(speech_codes, control_codes), speech_codes[:, :1], speech_codes)
 
 
-def tokens_to_str(tokens: torch.Tensor, lengths: torch.Tensor, tokenizer: AutoTokenizer, pad_id: int) -> list[str]:
+def tokens_to_str(
+    tokens: torch.Tensor,
+    lengths: torch.Tensor,
+    tokenizer: AutoTokenizer,
+    pad_id: int,
+    remove_special_tokens: bool = True,
+) -> list[str]:
     ans = []
     for hyp_ids, hyp_len in zip(tokens.cpu(), lengths.cpu()):
-        hyp_ids = hyp_ids[:hyp_len]
+        n = int(hyp_len.item()) if torch.is_tensor(hyp_len) else int(hyp_len)
+        if n <= 0:
+            ans.append("")
+            continue
+        hyp_ids = hyp_ids[:n]
         hyp_ids = hyp_ids[hyp_ids != pad_id]
-        ans.append(tokenizer.ids_to_text(hyp_ids))
+        if hyp_ids.numel() == 0:
+            ans.append("")
+            continue
+        ids_list = hyp_ids.tolist() if hasattr(hyp_ids, "tolist") else list(hyp_ids)
+        try:
+            ans.append(tokenizer.ids_to_text(ids_list, remove_special_tokens=remove_special_tokens))
+        except TypeError:
+            ans.append(tokenizer.ids_to_text(ids_list))
     return ans

@@ -59,12 +59,13 @@ class BLEU:
         for name in self._refs.keys():
             metric = torch.tensor(sacrebleu.corpus_bleu(self._hyps[name], [self._refs[name]]).score)
             corpus_metric[f"txt_bleu_{name}"] = metric
-        corpus_metric["txt_bleu"] = torch.stack(list(corpus_metric.values())).mean()
         self._refs.clear()
         self._hyps.clear()
+        if not corpus_metric:
+            return {}
+        corpus_metric["txt_bleu"] = torch.stack(list(corpus_metric.values())).mean()
         return corpus_metric
 
 
 def _identity(x):
     return x
-

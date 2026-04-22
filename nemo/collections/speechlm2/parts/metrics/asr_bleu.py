@@ -88,11 +88,13 @@ class ASRBLEU:
         for name in self._refs.keys():
             metric = torch.tensor(sacrebleu.corpus_bleu(self._hyps[name], [self._refs[name]]).score)
             corpus_metric[f"asr_bleu_{name}"] = metric
-        corpus_metric["asr_bleu"] = torch.stack(list(corpus_metric.values())).mean()
         self._refs.clear()
         self._hyps.clear()
         self.asr = None  # free up GPU memory
         torch.cuda.memory.empty_cache()
+        if not corpus_metric:
+            return {}
+        corpus_metric["asr_bleu"] = torch.stack(list(corpus_metric.values())).mean()
         return corpus_metric
 
 

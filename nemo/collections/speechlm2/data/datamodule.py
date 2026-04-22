@@ -99,10 +99,14 @@ class DataModule(LightningDataModule):
             with open_dict(cfg):
                 cfg.force_finite = True
                 cfg.force_map_dataset = True
+            # Use full validation/test data on every rank (no Lhotse shard split). Training still
+            # shards via train_dataloader. This keeps per-dataset BLEU keys identical across DDP
+            # ranks so Lightning can sync/log them to WandB (see PL #21409: mismatched keys +
+            # sync_dist drops or misplaces metrics).
             return get_lhotse_dataloader_from_config(
                 config=cfg,
-                global_rank=self._get_dp_rank(),
-                world_size=self._get_world_size(),
+                global_rank=0,
+                world_size=1,
                 dataset=self.dataset,
                 tokenizer=self.tokenizer,
             )
