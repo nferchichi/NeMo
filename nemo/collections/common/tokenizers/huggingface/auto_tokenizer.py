@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from typing import List, Optional
 
 from transformers import AutoTokenizer as AUTOTOKENIZER
@@ -330,14 +331,21 @@ class AutoTokenizer(TokenizerSpec):
 
         Returns:
             str: The reconstructed text.
+
+        Note:
+            Dropping special *tokens* from the list before ``convert_tokens_to_string`` merges adjacent
+            surface fragments (e.g. ``sold`` + ``^`` + ``in`` → ``soldin``). We decode with specials
+            present, then substitute each special string with a space so word boundaries are preserved.
         """
-        tokens = self.ids_to_tokens(ids)
-        if remove_special_tokens:
-            tokens_clean = [t for t in tokens if t not in self.tokenizer.all_special_tokens]
-        else:
-            tokens_clean = tokens
-        text = self.tokens_to_text(tokens_clean)
-        return text
+        if not ids:
+            return ""
+        if not remove_special_tokens:
+            return self.tokenizer.decode(ids, skip_special_tokens=False)
+        raw = self.tokenizer.decode(ids, skip_special_tokens=False)
+        specials = sorted({s for s in self.tokenizer.all_special_tokens if s}, key=len, reverse=True)
+        for st in specials:
+            raw = raw.replace(st, " ")
+        return re.sub(r"[ \t\r\n]+", " ", raw).strip()
 
     @property
     def vocab(self):

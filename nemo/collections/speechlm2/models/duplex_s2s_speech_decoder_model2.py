@@ -46,6 +46,7 @@ from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.metrics.asr_bleu import ASRBLEU
 from nemo.collections.speechlm2.parts.metrics.bleu import BLEU
+from nemo.collections.speechlm2.parts.metrics.text_metric_utils import simple_multilingual_normalize
 from nemo.collections.speechlm2.parts.metrics.wer import WER
 from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
 from nemo.collections.speechlm2.parts.metrics.token_accuracy import TokenAccuracy
@@ -1095,11 +1096,16 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
 
     def on_validation_epoch_start(self) -> None:
         self.on_train_epoch_start()
-        self.results_logger = ResultsLogger(self.validation_save_path).reset()
+        # Val sees full data on every DDP rank (DataModule); only rank 0 should write shared
+        # metadata/WAVs to avoid duplicate rows and parallel truncation on shared filesystems.
+        if self.trainer.is_global_zero:
+            self.results_logger = ResultsLogger(self.validation_save_path).reset()
+        else:
+            self.results_logger = None
 
-        self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
-        self.bleu = BLEU().reset()
-        self.all_bleu = BLEU().reset()
+        self.asr_bleu = ASRBLEU(self.cfg.scoring_asr, normalizer=simple_multilingual_normalize).reset()
+        self.bleu = BLEU(normalizer=simple_multilingual_normalize).reset()
+        self.all_bleu = BLEU(normalizer=simple_multilingual_normalize).reset()
         tolerance = int(
             self.cfg.get("val_acc_tolerance", 160) / (1000 / self.target_fps)
         )  # 160 ms as default tolerance --> 2 tokens for 12.5FPS and 1 for 25FPS
@@ -1110,11 +1116,11 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             token_name="text_eos", token_id=self.text_eos_id, tolerance=tolerance
         ).reset()
         if self.predict_user_text:
-            self.src_bleu = BLEU().reset()
+            self.src_bleu = BLEU(normalizer=simple_multilingual_normalize).reset()
             self.src_text_bos_acc = TokenAccuracy(
                 token_name="text_bos", token_id=self.user_bos_id, tolerance=tolerance
             ).reset()
-            self.src_wer = WER().reset()
+            self.src_wer = WER(normalizer=simple_multilingual_normalize).reset()
             self.empty_user_text = EmptyTextMetric().reset()
 
     def on_validation_epoch_end(self, prefix="val") -> None:
@@ -1174,44 +1180,57 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             
             results = self.offline_inference(dataset_batch, speaker_encoder_emb=speaker_encoder_emb)
 
+            _rm_spec = not self.cfg.get("val_decode_keep_special_tokens", False)
+            refs_for_log = dataset_batch["target_texts"]
+            src_refs_for_log = dataset_batch["source_texts"]
+            refs_for_metric_target = tokens_to_str(
+                dataset_batch["target_tokens"],
+                dataset_batch["target_token_lens"],
+                tokenizer=self.tokenizer,
+                pad_id=self.text_pad_id,
+                remove_special_tokens=_rm_spec,
+            )
+            refs_src_metric = dataset_batch["source_texts"]
+
             with fp32_precision():  # resample is fragile to bfloat16 default dtype
-                asr_hyps = self.asr_bleu.update(
+                self.asr_bleu.update(
                     name=name,
                     refs=dataset_batch["target_texts"],
                     pred_audio=resample(results["audio"], 22050, 16000),
                     pred_audio_lens=(results["audio_len"] / 22050 * 16000).to(torch.long),
                 )
+                if self.results_logger is not None:
+                    self.results_logger.update(
+                        name=name,
+                        refs=refs_for_log,
+                        hyps=results["text"],
+                        src_refs=src_refs_for_log,
+                        src_hyps_asr_head=results.get("src_text_asr_head"),
+                        src_hyps_rnnt=results.get("src_text_rnnt"),
+                        samples_id=dataset_batch['sample_id'],
+                        pred_audio=results["audio"],
+                        pred_audio_sr=self.target_sample_rate,
+                        user_audio=dataset_batch["source_audio"],
+                        user_audio_sr=self.source_sample_rate,
+                        fps=self.source_fps,
+                        results=results if self.cfg.get("dump_tokens_text", False) else None,
+                        tokenizer=self.tokenizer,
+                        ast_bleu_refs=refs_for_metric_target,
+                        ast_text_normalizer=self.bleu.normalizer,
+                        asr_wer_normalizer=self.src_wer.normalizer
+                        if self.predict_user_text
+                        else None,
+                    )
 
-                self.results_logger.update(
-                    name=name,
-                    refs=dataset_batch["target_texts"],
-                    hyps=results["text"],
-                    src_refs=dataset_batch["source_texts"],
-                    src_hyps=results["src_text"],
-                    src_hyps_asr_head=results.get("src_text_asr_head"),
-                    src_hyps_rnnt=results.get("src_text_rnnt"),
-                    all_refs=dataset_batch["all_texts"],
-                    all_hyps=results["all_text"],
-                    asr_hyps=asr_hyps,
-                    samples_id=dataset_batch['sample_id'],
-                    pred_audio=results["audio"],
-                    pred_audio_sr=self.target_sample_rate,
-                    user_audio=dataset_batch["source_audio"],
-                    user_audio_sr=self.source_sample_rate,
-                    fps=self.source_fps,
-                    results=results if self.cfg.get("dump_tokens_text", False) else None,
-                    tokenizer=self.tokenizer,
-                )
-
-            self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
+            self.bleu.update(name=name, refs=refs_for_metric_target, hyps=results["text"])
             self.all_bleu.update(name=name, refs=dataset_batch["all_texts"], hyps=results["all_text"])
             self.text_bos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
             self.text_eos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])
 
             if self.predict_user_text:
                 src_text_clean = [s.replace("^", " ").replace("$", " ") for s in results["src_text"]]
-                self.src_bleu.update(name=name, refs=dataset_batch["source_texts"], hyps=src_text_clean)
-                self.src_wer.update(name=name, refs=dataset_batch["source_texts"], hyps=src_text_clean)
+                self.src_bleu.update(name=name, refs=refs_src_metric, hyps=src_text_clean)
+                self.src_wer.update(name=name, refs=refs_src_metric, hyps=src_text_clean)
                 self.empty_user_text.update(name=name, hyps=results["src_text"])
 
     def on_test_epoch_start(self) -> None:
@@ -1663,7 +1682,14 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
 
         if self.cfg.get("custom_sample_inference", None):
             print(ans["audio"].shape, input_signal.shape)
-            self.results_logger.merge_and_save_audio(self.cfg.custom_sample_inference+"inf.wav", pred_audio=ans["audio"][0], pred_audio_sr=self.target_sample_rate, user_audio=input_signal[0], user_audio_sr=self.source_sample_rate)
+            if self.trainer.is_global_zero and self.results_logger is not None:
+                self.results_logger.merge_and_save_audio(
+                    self.cfg.custom_sample_inference + "inf.wav",
+                    pred_audio=ans["audio"][0],
+                    pred_audio_sr=self.target_sample_rate,
+                    user_audio=input_signal[0],
+                    user_audio_sr=self.source_sample_rate,
+                )
             exit()
         return ans
 

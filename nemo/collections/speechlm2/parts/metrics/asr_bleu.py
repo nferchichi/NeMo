@@ -19,6 +19,7 @@ from whisper_normalizer.english import EnglishTextNormalizer
 
 from nemo.collections.asr.models import ASRModel
 from nemo.collections.common.parts.optional_cuda_graphs import WithOptionalCudaGraphs
+from nemo.collections.speechlm2.parts.metrics.text_metric_utils import normalize_for_metric
 from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.speechlm2.parts.pretrained import load_pretrained_nemo
 from nemo.utils import logging
@@ -46,9 +47,6 @@ class ASRBLEU:
         self._hyps = defaultdict(list)
 
     def reset(self):
-        # Cleaning up GPU memory before we load ASRModel, because it may already
-        # be quite fragmented and close to the limit after observing many
-        # dynamic shapes during the training epoch.
         torch.cuda.memory.empty_cache()
         with fp32_precision():  # Some NeMo ASR models weren't trained with bfloat16.
             self.asr = load_pretrained_nemo(ASRModel, self.pretrained_asr_name).eval()
@@ -72,13 +70,15 @@ class ASRBLEU:
             )
         asr_hyps_texts = []
         for ref, asr_hyp in zip(refs, asr_hyps):
-            asr_hyp = asr_hyp.text
-            self._refs[name].append(self.normalizer(ref))
-            self._hyps[name].append(self.normalizer(asr_hyp))
+            asr_hyp_raw = asr_hyp.text
+            ref_n = normalize_for_metric(ref, self.normalizer)
+            hyp_n = normalize_for_metric(asr_hyp_raw, self.normalizer)
+            self._refs[name].append(ref_n)
+            self._hyps[name].append(hyp_n)
             if self.verbose:
-                asrb = sacrebleu.sentence_bleu(asr_hyp, [ref]).score
-                logging.info(f"[REF]\t{ref}\n[ASR]\t{asr_hyp} [{asrb:.2f}]")
-            asr_hyps_texts.append(asr_hyp)
+                asrb = sacrebleu.sentence_bleu(hyp_n, [ref_n]).score
+                logging.info(f"[REF]\t{ref_n}\n[ASR]\t{hyp_n} [{asrb:.2f}]")
+            asr_hyps_texts.append(asr_hyp_raw)
 
         return asr_hyps_texts
 
@@ -90,7 +90,7 @@ class ASRBLEU:
             corpus_metric[f"asr_bleu_{name}"] = metric
         self._refs.clear()
         self._hyps.clear()
-        self.asr = None  # free up GPU memory
+        self.asr = None
         torch.cuda.memory.empty_cache()
         if not corpus_metric:
             return {}

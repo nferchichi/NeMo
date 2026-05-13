@@ -14,6 +14,7 @@
 
 import re
 import logging
+import unicodedata
 from typing import List, Dict, Any, Optional
 
 import numpy as np
@@ -21,6 +22,18 @@ import torch
 import torchaudio
 
 from lhotse import CutSet, MonoCut, Seconds, SupervisionSegment
+
+# Latin ligatures / letters that do not decompose under NFD (MMS_FA tokenizer OOV); proxy string only.
+_MMS_LATIN_COMPAT = str.maketrans(
+    {
+        "ß": "ss",
+        "ſ": "s",
+        "œ": "oe",
+        "Œ": "oe",
+        "æ": "ae",
+        "Æ": "ae",
+    }
+)
 
 
 class ForceAligner:
@@ -156,6 +169,10 @@ class ForceAligner:
         if not transcript_words:
             logging.warning(f"No valid words found in transcript: {transcript}")
             return None
+
+        # MMS_FA vocab is limited; fold accents on a *proxy* only so we still emit timestamps for
+        # original Unicode words via _convert_wav2vec2_alignment_to_timestamped_text(orig_words[i]).
+        align_words = [self._fold_word_for_mms_tokenizer(w) for w in transcript_words]
         
         if sample_rate != 16000:
             waveform = torchaudio.functional.resample(waveform, sample_rate, 16000)
@@ -167,7 +184,7 @@ class ForceAligner:
         with torch.no_grad():
             emission, _ = self.wav2vec2_model(waveform)
         
-        tokens = self.wav2vec2_tokenizer(transcript_words)
+        tokens = self.wav2vec2_tokenizer(align_words)
         token_spans = self.wav2vec2_aligner(emission[0], tokens)
         
         if not token_spans:
@@ -192,12 +209,34 @@ class ForceAligner:
         
         return word_segments
     
+    @staticmethod
+    def _fold_word_for_mms_tokenizer(word: str) -> str:
+        """
+        Map each word to something MMS_FA can tokenize (Latin-ish), without changing the stored
+        transcript: alignment still returns one span per original whitespace token. Uses NFKC
+        (compatibility ligatures), explicit ß/œ/æ-style replacements (no NFD decomposition in
+        Unicode), then NFD + drop combining marks.
+        """
+        if not word:
+            return word
+        w = unicodedata.normalize("NFKC", word)
+        w = w.translate(_MMS_LATIN_COMPAT)
+        decomposed = unicodedata.normalize("NFD", w)
+        folded = "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")
+        return folded if folded else word
+
     def _normalize_transcript(self, transcript: str) -> str:
-        """Normalize transcript by removing punctuation and converting to lowercase."""
+        """Lowercase and map punctuation to space; keep Unicode letters in the logical transcript."""
         text = transcript.lower()
         text = text.replace("'", "'")
-        text = re.sub(r"[^a-z' ]", " ", text)
-        text = re.sub(r' +', ' ', text)
+        out = []
+        for ch in text:
+            if ch == "'" or ch.isalpha():
+                out.append(ch)
+            else:
+                out.append(" ")
+        text = "".join(out)
+        text = re.sub(r" +", " ", text)
         return text.strip()
     
     def _convert_wav2vec2_alignment_to_timestamped_text(self, alignment_result: List[Dict[str, Any]], original_text: str) -> str:
@@ -211,9 +250,12 @@ class ForceAligner:
         Returns:
             Text with timestamp tokens in the format <|start_frame|>word<|end_frame|>
         """
+        orig_words = re.split(r"\s+", original_text.strip()) if original_text else []
+        use_orig_words = len(orig_words) == len(alignment_result)
+
         timestamped_words = []
-        for word_seg in alignment_result:
-            word = word_seg["word"]
+        for i, word_seg in enumerate(alignment_result):
+            word = orig_words[i] if use_orig_words else word_seg["word"]
             start_frame = int(word_seg["start"] / self.frame_length)
             end_frame = int(word_seg["end"] / self.frame_length)
             timestamped_words.append(f"<|{start_frame}|> {word} <|{end_frame}|>")

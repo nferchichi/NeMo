@@ -45,6 +45,7 @@ from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.metrics.asr_bleu import ASRBLEU
 from nemo.collections.speechlm2.parts.metrics.bleu import BLEU
+from nemo.collections.speechlm2.parts.metrics.text_metric_utils import simple_multilingual_normalize
 from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
 from nemo.collections.speechlm2.parts.metrics.token_accuracy import TokenAccuracy
 from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
@@ -1589,10 +1590,13 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
 
     def on_validation_epoch_start(self) -> None:
         self.on_train_epoch_start()
-        self.results_logger = ResultsLogger(self.validation_save_path).reset()
+        if self.trainer.is_global_zero:
+            self.results_logger = ResultsLogger(self.validation_save_path).reset()
+        else:
+            self.results_logger = None
 
-        self.asr_bleu = ASRBLEU(self.cfg.scoring_asr).reset()
-        self.bleu = BLEU().reset()
+        self.asr_bleu = ASRBLEU(self.cfg.scoring_asr, normalizer=simple_multilingual_normalize).reset()
+        self.bleu = BLEU(normalizer=simple_multilingual_normalize).reset()
         tolerance = int(
             self.cfg.get("val_acc_tolerance", 160) / (1000 / self.target_fps)
         )  # 160 ms as default tolerance --> 2 tokens for 12.5FPS and 1 for 25FPS
@@ -1635,32 +1639,43 @@ class DuplexS2SSpeechDecoderModel(LightningModule, HFHubMixin):
             )
 
             with fp32_precision():  # resample is fragile to bfloat16 default dtype
-                asr_hyps = self.asr_bleu.update(
+                self.asr_bleu.update(
                     name=name,
                     refs=dataset_batch["target_texts"],
                     pred_audio=resample(results["audio"], 22050, 16000),
                     pred_audio_lens=(results["audio_len"] / 22050 * 16000).to(torch.long),
                 )
 
-                self.results_logger.update(
-                    name=name,
-                    refs=dataset_batch["target_texts"],
-                    hyps=results["text"],
-                    asr_hyps=asr_hyps,
-                    samples_id=dataset_batch['sample_id'],
-                    pred_audio=results["audio"],
-                    pred_audio_sr=self.target_sample_rate,
-                    user_audio=dataset_batch["source_audio"],
-                    user_audio_sr=self.source_sample_rate,
-                    eou_pred=(
-                        results["gen_eou"]
-                        if "gen_eou" in results
-                        else None
-                    ),
-                    fps=self.source_fps,
-                    results=results if self.cfg.get("dump_tokens_text", False) else None,
-                    tokenizer=self.tokenizer,
-                )
+                if self.results_logger is not None:
+                    _refs = dataset_batch["target_texts"]
+                    _n = len(_refs)
+                    _src = dataset_batch.get("source_texts", [""] * _n)
+                    if len(_src) < _n:
+                        _src = list(_src) + [""] * (_n - len(_src))
+                    self.results_logger.update(
+                        name=name,
+                        refs=_refs,
+                        hyps=results["text"],
+                        src_refs=_src[:_n],
+                        src_hyps_asr_head=None,
+                        src_hyps_rnnt=None,
+                        samples_id=dataset_batch['sample_id'],
+                        pred_audio=results["audio"],
+                        pred_audio_sr=self.target_sample_rate,
+                        user_audio=dataset_batch["source_audio"],
+                        user_audio_sr=self.source_sample_rate,
+                        eou_pred=(
+                            results["gen_eou"]
+                            if "gen_eou" in results
+                            else None
+                        ),
+                        fps=self.source_fps,
+                        results=results if self.cfg.get("dump_tokens_text", False) else None,
+                        tokenizer=self.tokenizer,
+                        ast_bleu_refs=_refs,
+                        ast_text_normalizer=self.bleu.normalizer,
+                        asr_wer_normalizer=None,
+                    )
 
             self.bleu.update(name=name, refs=dataset_batch["target_texts"], hyps=results["text"])
             self.text_bos_acc.update(name=name, refs=dataset_batch["target_tokens"], hyps=results["tokens_text"])

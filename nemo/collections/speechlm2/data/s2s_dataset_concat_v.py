@@ -60,6 +60,12 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
         force_align_user_text (bool, optional):
             If True, performs force alignment on user audio segments to generate word-level timestamps.
             Only applies to supervision turns where speaker.role is "user". Defaults to False.
+            Controlled via ``model_cfg["force_align_user_text"]`` when ``model_cfg`` is set.
+
+        force_align_device (str, optional):
+            Device for the wav2vec2 force aligner (e.g. ``"cpu"`` or ``"cuda"``). If omitted, uses
+            ``model_cfg["force_align_device"]`` when present, otherwise defaults to ``"cpu"`` for
+            stable multi-worker / multi-GPU data loading.
 
     Returns:
         A dictionary with the following keys:
@@ -113,10 +119,16 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
         self.predict_user_text = predict_user_text
         self.cfg = cfg
         self.model_cfg = model_cfg
-        self.force_align_user_text = self.model_cfg.get("force_align_user_text", False) if self.model_cfg is not None else None
-        self.force_align_user_text = True
+        self.force_align_user_text = (
+            bool(self.model_cfg.get("force_align_user_text", False)) if self.model_cfg is not None else False
+        )
         self.force_align_asr_model_path = self.model_cfg.get("force_align_asr_model_path", None) if self.model_cfg is not None else None
-        self.force_align_device = force_align_device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if force_align_device is not None:
+            self.force_align_device = force_align_device
+        elif self.model_cfg is not None:
+            self.force_align_device = self.model_cfg.get("force_align_device", "cpu")
+        else:
+            self.force_align_device = "cpu"
 
         # Initialize force aligner if needed
         self.force_aligner = None

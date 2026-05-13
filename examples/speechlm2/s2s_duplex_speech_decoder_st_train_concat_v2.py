@@ -28,7 +28,6 @@ torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 @hydra_runner(config_path="conf", config_name="s2s_duplex_speech_decoder")
 def train(cfg):
     OmegaConf.resolve(cfg)
-    torch.distributed.init_process_group(backend="nccl")
     torch.set_float32_matmul_precision("medium")
     torch.backends.cudnn.allow_tf32 = True
     trainer = Trainer(**resolve_trainer_cfg(cfg.trainer))
@@ -48,6 +47,7 @@ def train(cfg):
         predict_user_text=getattr(cfg.model, "predict_user_text", False),
         cfg=cfg.data,
         model_cfg=cfg.model,
+        force_align_device=OmegaConf.select(cfg.model, "force_align_device", default=None),
     )
     datamodule = DataModule(cfg.data, tokenizer=model.tokenizer, dataset=dataset)
 

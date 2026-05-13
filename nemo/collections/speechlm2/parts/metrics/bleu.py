@@ -17,13 +17,16 @@ import sacrebleu
 import torch
 from whisper_normalizer.english import EnglishTextNormalizer
 
+from nemo.collections.speechlm2.parts.metrics.text_metric_utils import normalize_for_metric
 from nemo.utils import logging
 
 
 class BLEU:
     """
     Computes BLEU scores on text predictions.
-    By default, uses Whisper's EnglishTextNormalizer on hypotheses and references.
+    References and hypotheses are passed through strip_language_tags_for_scoring then
+    EnglishTextNormalizer (or a custom normalizer), matching validation JSON when the same
+    normalizer instance is passed to ResultsLogger.
     """
 
     def __init__(self, normalize: bool = True, normalizer=None, verbose: bool = True):
@@ -44,14 +47,14 @@ class BLEU:
 
     def update(self, name: str, refs: list[str], hyps: list[str]) -> None:
         for ref, hyp in zip(refs, hyps):
-            normalized_ref = self.normalizer(ref)
-            normalized_hyp = self.normalizer(hyp)
-            
+            normalized_ref = normalize_for_metric(ref, self.normalizer)
+            normalized_hyp = normalize_for_metric(hyp, self.normalizer)
+
             self._refs[name].append(normalized_ref)
             self._hyps[name].append(normalized_hyp)
 
             if self.verbose:
-                asrb = sacrebleu.sentence_bleu(normalized_ref, [normalized_hyp]).score
+                asrb = sacrebleu.sentence_bleu(normalized_hyp, [normalized_ref]).score
                 logging.info(f"[REF]\t{normalized_ref}\n[HYP]\t{normalized_hyp} [{asrb:.2f}]")
 
     def compute(self) -> dict[str, torch.Tensor]:
