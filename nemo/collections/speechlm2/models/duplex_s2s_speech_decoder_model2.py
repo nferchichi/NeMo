@@ -19,6 +19,7 @@ import copy
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import torch.utils.checkpoint  # used by the optional RNNT-loss activation checkpoint path
 import torchaudio
 from lightning import LightningModule
 from omegaconf import DictConfig, OmegaConf
@@ -46,7 +47,9 @@ from nemo.collections.speechlm2.parts.hf_hub import HFHubMixin
 from nemo.collections.speechlm2.parts.lora import maybe_install_lora
 from nemo.collections.speechlm2.parts.metrics.asr_bleu import ASRBLEU
 from nemo.collections.speechlm2.parts.metrics.bleu import BLEU
-from nemo.collections.speechlm2.parts.metrics.text_metric_utils import simple_multilingual_normalize
+from nemo.collections.speechlm2.parts.metrics.text_metric_utils import (
+    simple_multilingual_normalize,
+)
 from nemo.collections.speechlm2.parts.metrics.wer import WER
 from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
 from nemo.collections.speechlm2.parts.metrics.token_accuracy import TokenAccuracy
@@ -59,6 +62,7 @@ from nemo.collections.speechlm2.parts.pretrained import (
     setup_audio_codec,
     setup_speech_encoder,
     setup_rnnt_decoder_joint,
+    setup_ctc_decoder,
 )
 from nemo.core.neural_types import AudioSignal, LabelsType, LengthsType, NeuralType
 from nemo.utils import logging
@@ -73,6 +77,31 @@ def _get_rnnt_decoding_module():
         RNNTBPEDecodingConfig,
     )
     return RNNTDecoding, RNNTDecodingConfig, RNNTBPEDecoding, RNNTBPEDecodingConfig
+
+
+def _get_rnnt_loss_class():
+    """Lazy import for the standard NeMo RNNT loss wrapper (warprnnt/numba/pytorch backends auto-resolved).
+
+    Mirrors ``_get_rnnt_decoding_module`` so the asr.losses import chain (numba check, k2 check,
+    optional warp-rnnt bindings) is paid only when ``model.use_rnnt_loss=true``. Keeps the
+    speechlm2 model importable on environments without an RNNT loss backend.
+    """
+    from nemo.collections.asr.losses.rnnt import RNNTLoss
+
+    return RNNTLoss
+
+
+def _get_ctc_loss_class():
+    """Lazy import for the NeMo CTC loss wrapper.
+
+    Mirrors :func:`_get_rnnt_loss_class`; the asr.losses chain is paid only when
+    ``model.use_ctc_loss=true`` (expN+). The wrapper is a thin subclass of
+    ``torch.nn.CTCLoss`` with ``reduction='mean_batch'`` support; see
+    ``nemo/collections/asr/losses/ctc.py:CTCLoss``.
+    """
+    from nemo.collections.asr.losses.ctc import CTCLoss
+
+    return CTCLoss
 
     
 def delay_eos(tokens, eos_token_id, pad_token_id, shift=10):
@@ -201,6 +230,84 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
         setup_speech_encoder(self)
         # Optionally load RNNT decoder and joint (set pretrained_rnnt_asr in config)
         setup_rnnt_decoder_joint(self)
+
+        # Optional RNNT-loss training (expI+). Gated so every prior experiment (default False)
+        # is byte-identical: when use_rnnt_loss is unset/false, no extra module is constructed
+        # and no extra import is performed.
+        self.rnnt_loss = None
+        if self.cfg.get("use_rnnt_loss", False):
+            if self.rnnt_joint is None or self.rnnt_decoder is None:
+                raise ValueError(
+                    "model.use_rnnt_loss=true requires both rnnt_decoder and rnnt_joint to be loaded; "
+                    "set model.pretrained_rnnt_asr to a NeMo ASR checkpoint exposing decoder+joint."
+                )
+            if self.rnnt_tokenizer is None:
+                raise ValueError(
+                    "model.use_rnnt_loss=true requires the pretrained ASR checkpoint to ship a tokenizer "
+                    "(needed to BPE-encode batch['source_texts'] into RNNT joint targets)."
+                )
+            # NeMo convention: RNNTLoss(num_classes=...) expects the BLANK index, which equals
+            # vocab_size_without_blank, i.e. num_classes_with_blank - 1 (blank is the last id).
+            blank_idx = self.rnnt_joint.num_classes_with_blank - 1
+            self.rnnt_loss = _get_rnnt_loss_class()(num_classes=blank_idx, reduction='mean_batch')
+            # The joint loaded from the pretrained .nemo defaults to `_fuse_loss_wer=True`
+            # (NeMo's standard RNNT recipe co-fuses joint+loss+WER for memory). We use the
+            # non-fused path: rnnt_joint(encoder_outputs, decoder_outputs) -> logits, then
+            # apply RNNTLoss separately. Without this toggle, the joint's forward() would
+            # take the fused branch at line 1448 of asr/modules/rnnt.py and raise
+            # "`fuse_loss_wer` flag is set, but `loss` and `wer` modules were not provided!".
+            # Decoding is unaffected — validation goes through RNNTDecoding which calls
+            # joint.joint_after_projection() directly, bypassing the fused-mode branch.
+            if hasattr(self.rnnt_joint, "set_fuse_loss_wer"):
+                self.rnnt_joint.set_fuse_loss_wer(False)
+            else:  # very old NeMo with no public setter; fall back to private attribute
+                self.rnnt_joint._fuse_loss_wer = False
+            logging.info(
+                "use_rnnt_loss=True -> constructed RNNTLoss(blank_idx=%d, vocab_with_blank=%d) "
+                "and forced rnnt_joint._fuse_loss_wer=False for non-fused training. "
+                "Set model.rnnt_loss_weight to scale its contribution in training_step.",
+                blank_idx,
+                self.rnnt_joint.num_classes_with_blank,
+            )
+
+        # Optional CTC-auxiliary side objective (expN+). Symmetric to the RNNT block above.
+        # Default-off: every recipe that does not set `use_ctc_loss=true` skips both the
+        # pretrained CTC-head load (no extra .nemo restore) and the CTCLoss construction,
+        # so expA-expM are byte-identical -- no new attributes, no extra I/O on restart.
+        self.ctc_head = None
+        self.ctc_loss = None
+        if self.cfg.get("use_ctc_loss", False):
+            setup_ctc_decoder(self)
+            if self.ctc_head is None:
+                raise ValueError(
+                    "model.use_ctc_loss=true requires a CTC head to be loaded; set "
+                    "model.pretrained_ctc_asr (or model.pretrained_rnnt_asr) to a hybrid "
+                    "RNNT+CTC .nemo checkpoint exposing ctc_decoder (e.g. "
+                    "EncDecHybridRNNTCTCBPEModel)."
+                )
+            # CTC blank convention (NeMo CTCLoss): `num_classes` arg == blank id, which
+            # equals vocab-with-blank minus 1, matching the RNNTLoss convention used
+            # for `blank_idx` above. Hybrid-model invariant: CTC and RNNT share the
+            # same BPE vocab, so the two blank ids must agree.
+            ctc_blank_idx = self.ctc_head.num_classes_with_blank - 1
+            if self.rnnt_joint is not None:
+                rnnt_blank_idx = self.rnnt_joint.num_classes_with_blank - 1
+                if ctc_blank_idx != rnnt_blank_idx:
+                    raise ValueError(
+                        f"CTC blank idx ({ctc_blank_idx}) must match RNNT blank idx "
+                        f"({rnnt_blank_idx}); hybrid RNNT+CTC pretrained model invariant "
+                        "violated. Ensure pretrained_ctc_asr and pretrained_rnnt_asr "
+                        "point at the same hybrid .nemo checkpoint."
+                    )
+            self.ctc_loss = _get_ctc_loss_class()(
+                num_classes=ctc_blank_idx, reduction='mean_batch', zero_infinity=True
+            )
+            logging.info(
+                "use_ctc_loss=True -> constructed CTCLoss(blank_idx=%d, vocab_with_blank=%d). "
+                "Set model.ctc_loss_weight to scale its contribution in training_step.",
+                ctc_blank_idx,
+                self.ctc_head.num_classes_with_blank,
+            )
 
         llm_tokenizer_vocab_items = self.tokenizer.vocab
         # if vocab is a dict it already has the subword and token id, if not, get it from the tokenizer
@@ -1000,6 +1107,81 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
 
         return ans
 
+    def _rnnt_joint_and_loss(
+        self,
+        encoder_outputs,
+        decoder_outputs,
+        targets,
+        encoder_lengths,
+        target_lengths,
+        use_ckpt: bool = False,
+    ):
+        """Compute one rnnt_joint + rnnt_loss pair, with optional activation checkpointing.
+
+        This is the single chokepoint that allocates the three large per-step tensors
+        in the RNNT path:
+
+          1. `joint_out`  : (B, T, U+1, V+1) bf16  (the joint logits)
+          2. `acts`       : same shape, fp32       (RNNTLoss upcasts internally)
+          3. `grads`      : same shape, fp32       (numba kernel allocates and
+                                                   `ctx.save_for_backward`'s this)
+
+        When `use_ckpt=False` the three tensors are produced as usual and kept
+        alive by the autograd graph until the surrounding training_step's
+        `loss.backward()` consumes them — i.e. they pile up on top of the LLM,
+        audio_codec and ASR-head forward activations.
+
+        When `use_ckpt=True` the body is run under
+        `torch.utils.checkpoint.checkpoint(use_reentrant=False)`, which:
+          * On the first forward, records the inputs only (no joint_out / acts /
+            grads are persisted).
+          * During backward of this block, re-runs the body with grad enabled,
+            recreating joint_out / acts / grads just long enough to compute the
+            gradient w.r.t. the checkpoint inputs (encoder_outputs +
+            decoder_outputs), then frees them.
+
+        Net effect: the ~16-20 GiB worst-case footprint of joint+acts+grads only
+        co-exists with a *partially-freed* training_step state (during backward)
+        instead of the full peak forward state, which is what was OOMing earlier
+        expI runs at `torch.zeros_like(acts)` (rnnt_pytorch.py:58).
+        """
+        if use_ckpt:
+            return torch.utils.checkpoint.checkpoint(
+                self._rnnt_joint_and_loss_inner,
+                encoder_outputs,
+                decoder_outputs,
+                targets,
+                encoder_lengths,
+                target_lengths,
+                use_reentrant=False,
+            )
+        return self._rnnt_joint_and_loss_inner(
+            encoder_outputs,
+            decoder_outputs,
+            targets,
+            encoder_lengths,
+            target_lengths,
+        )
+
+    def _rnnt_joint_and_loss_inner(
+        self,
+        encoder_outputs,
+        decoder_outputs,
+        targets,
+        encoder_lengths,
+        target_lengths,
+    ):
+        """Inner body of the RNNT joint+loss path; kept separate so it can be passed
+        to `torch.utils.checkpoint.checkpoint` as a plain callable."""
+        joint_out = self.rnnt_joint(
+            encoder_outputs=encoder_outputs, decoder_outputs=decoder_outputs
+        )
+        return self.rnnt_loss(
+            log_probs=joint_out,
+            targets=targets,
+            input_lengths=encoder_lengths,
+            target_lengths=target_lengths,
+        )
 
     def training_step(self, batch: dict, batch_idx: int):
         for m in (self.perception.preprocessor, self.perception.encoder, self.llm, self.speech_generation):
@@ -1068,6 +1250,230 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
         if self.cfg.get("use_separate_asr_head", False):
             loss = loss + self.cfg.get('asr_loss_weight', 1.0) * asr_loss
 
+        # ---- Optional RNNT-loss side objective (expI+) -----------------------------------
+        # Gated on `use_rnnt_loss` (default False). When the gate is False this block is a
+        # complete no-op, so expA-expH_v2 are byte-identical. When True we feed asr_emb +
+        # BPE-encoded source_texts into the (now-trainable) rnnt_decoder/joint and add the
+        # transducer loss with weight `rnnt_loss_weight`. Encoder stays frozen via the
+        # rnnt-finetune YAML overlay, so gradients here only reach rnnt_decoder/joint.
+        rnnt_loss_val = None
+        ctc_loss_val = None
+        if self.cfg.get("use_rnnt_loss", False) and self.rnnt_loss is not None:
+            source_texts = batch.get("source_texts", None)
+            if source_texts is None:
+                raise KeyError(
+                    "model.use_rnnt_loss=true but batch is missing 'source_texts'; the data pipeline "
+                    "must provide per-cut source-language transcriptions (e.g. s2s_dataset_concat_v.py)."
+                )
+            # Optional per-sample BCP-47 language-tag suffix on the RNNT target (expJ+).
+            #
+            # WHY: the pretrained multilingual RNNT we load
+            # (cache_aware_non_prompt_600m_*.nemo, ++model.pretrained_rnnt_asr) was
+            # trained on targets of the form "<transcript> <xx-XX>", where <xx-XX> is
+            # one of 39 dedicated single-token language anchors in its SentencePiece
+            # vocab (universal_merged_tokenizer_latest_40: <fr-FR>=993, <es-US>=3051,
+            # <de-DE>=518, ...). Our training shars supply clean transcripts WITHOUT
+            # tags, so by default the transducer loss penalizes every <xx-XX> emission
+            # as a "wrong token" and the model unlearns its language-anchor habit —
+            # exactly the symptom observed in expI (0 tag emissions in run_22 vs
+            # 24/64=37% in the pretrained baseline), which correlates with the WER
+            # degradation that motivates expJ.
+            #
+            # FIX (when `model.rnnt_target_lang_suffix=true`): append the per-cut
+            # BCP-47 tag carried on `batch['target_lang']` (populated by the Lhotse
+            # collator from `tags: {target_lang: <code>}` on each YAML group). Cost is
+            # one extra special token per sample (PieceToId('<fr-FR>') is atomic, not
+            # a multi-piece sequence), so target_lengths grow by ~1 only.
+            #
+            # GATED, DEFAULT OFF: `self.cfg.get("rnnt_target_lang_suffix", False)`.
+            # When False (every existing recipe), behavior is byte-identical to
+            # pre-expJ. When True but the batch carries no per-cut tag for a sample
+            # (e.g. data YAML not annotated), that sample falls back to the clean
+            # transcript (no suffix), so the path degrades safely.
+            if self.cfg.get("rnnt_target_lang_suffix", False):
+                target_langs = batch.get("target_lang", None)
+                if target_langs is None:
+                    target_langs = [None] * len(source_texts)
+                src_for_rnnt = [
+                    (f"{(t or '').strip()} <{l}>" if l else (t or "").strip())
+                    for t, l in zip(source_texts, target_langs)
+                ]
+            else:
+                src_for_rnnt = [(t or "").strip() for t in source_texts]
+            # BPE-encode each source utterance through the RNNT's own tokenizer. Empty
+            # transcripts (rare; agent-only turns) are excluded — RNNTLoss requires U >= 1.
+            ids_lists = [self.rnnt_tokenizer.text_to_ids(s) for s in src_for_rnnt]
+            keep_idx = [i for i, ids in enumerate(ids_lists) if len(ids) > 0]
+            if len(keep_idx) > 0:
+                kept_ids = [ids_lists[i] for i in keep_idx]
+                target_lengths = torch.tensor(
+                    [len(ids) for ids in kept_ids], device=self.device, dtype=torch.long
+                )
+                max_u = int(target_lengths.max().item())
+                targets = torch.zeros((len(kept_ids), max_u), device=self.device, dtype=torch.long)
+                for i, ids in enumerate(kept_ids):
+                    targets[i, : len(ids)] = torch.tensor(ids, device=self.device, dtype=torch.long)
+                keep_t = torch.tensor(keep_idx, device=self.device, dtype=torch.long)
+                # asr_emb in prepare_inputs is (B, T-1, D); rnnt_joint expects (B, D, T).
+                # Pick the non-empty subset (sub_emb is (B_kept, T, D)) and figure out the
+                # actual max encoder length in this sub-batch — important for memory.
+                sub_emb = inputs["asr_emb"].index_select(0, keep_t)
+                sub_lens = inputs["input_lens"].index_select(0, keep_t).clamp(
+                    min=1, max=sub_emb.shape[1]
+                )
+                # MEMORY OPT: truncate the time dimension to the actual max length in this
+                # sub-batch BEFORE the joint. Without this, joint_out has shape
+                # (B_kept, T_full, U+1, V+1) and RNNTLoss internally narrows to
+                # (B_kept, max(sub_lens), U+1, V+1) AND fp32-upcasts AND .contiguous()-copies
+                # the result (see asr/losses/rnnt.py:467 + :476). That 4-bytes-per-element
+                # copy was the exact source of the 6.49 GiB allocation that OOM'd expI's
+                # first real run. Truncating up-front makes log_probs.shape[1] == max_logit_len,
+                # so RNNTLoss's narrow becomes a no-op and the upcast is performed on the
+                # smaller tensor only.
+                max_enc_len = int(sub_lens.max().item())
+                if max_enc_len < sub_emb.shape[1]:
+                    sub_emb = sub_emb[:, :max_enc_len, :].contiguous()
+                encoder_outputs = sub_emb.transpose(1, 2).contiguous()
+                encoder_lengths = sub_lens
+                # NeMo RNNT decoder forward returns (decoder_outputs[B, D, U+1], target_length, state).
+                # Joint: (B, D, T) x (B, D, U+1) -> (B, T, U+1, V+1) logits.
+                #
+                # MEMORY OPT 2 + 3: per-chunk activation checkpointing of joint + loss.
+                # The joint produces a (B, T, U+1, V+1) bf16 tensor; RNNTLoss internally
+                # upcasts it to fp32 (`acts`) and the numba kernel allocates a same-shape
+                # fp32 grads buffer that is `ctx.save_for_backward`'d. With the multilingual
+                # RNNT we load (V+1 = 13088), these three tensors briefly co-existing
+                # inside the loss forward is ~20 GiB at typical CVSS lengths.
+                #
+                # Knob 1 (`rnnt_loss_use_checkpoint`): wraps the joint+loss in
+                # torch.utils.checkpoint.checkpoint(use_reentrant=False). On its own this
+                # does NOT change the inside-fn peak (the body still runs in full during
+                # forward; checkpoint only avoids *saving* the function outputs across
+                # the boundary). It IS, however, the prerequisite for knob 2 below.
+                #
+                # Knob 2 (`rnnt_loss_chunk_size`): processes the keep-set in chunks of
+                # `chunk_size` each. With chunk_size=1 and the checkpoint wrapper, each
+                # chunk's inside-fn peak is the per-sample joint (~5 GiB) instead of the
+                # per-batch joint (~20 GiB) — and because checkpoint immediately releases
+                # each chunk's joint/acts/grads, the chunks DO NOT pile up: the loop's
+                # peak is bounded by a single chunk's inside-fn peak.
+                #
+                # Required combination: chunk_size > 0  AND  use_checkpoint = True.
+                # Knob 1 alone -> no change (run_11 hit OOM with checkpoint on).
+                # Knob 2 alone -> no change either (all chunks' graphs kept alive).
+                # Both gated on `use_rnnt_loss`, so pre-expI experiments stay byte-identical.
+                use_ckpt = bool(self.cfg.get("rnnt_loss_use_checkpoint", False))
+                chunk_size = int(self.cfg.get("rnnt_loss_chunk_size", 0) or 0)
+                n_kept = encoder_outputs.shape[0]
+                if chunk_size <= 0 or chunk_size >= n_kept:
+                    decoder_outputs, _, _ = self.rnnt_decoder(targets=targets, target_length=target_lengths)
+                    rnnt_loss_val = self._rnnt_joint_and_loss(
+                        encoder_outputs=encoder_outputs,
+                        decoder_outputs=decoder_outputs,
+                        targets=targets,
+                        encoder_lengths=encoder_lengths,
+                        target_lengths=target_lengths,
+                        use_ckpt=use_ckpt,
+                    )
+                else:
+                    # Chunk loop: average per-sample losses across chunks so the weight stays
+                    # comparable to the un-chunked case (RNNTLoss reduction='mean_batch').
+                    #
+                    # IMPORTANT: `targets` is padded to `max_u` over the WHOLE keep-set,
+                    # and `encoder_outputs` to `max_enc_len` over the whole keep-set.
+                    # Slicing alone preserves those global pad widths, so for any chunk
+                    # whose internal max length is smaller than the global max we'd:
+                    #   1. waste memory on padding (kills the whole point of chunking),
+                    #   2. trip RNNTLoss.certify_inputs, which requires
+                    #      `joint.shape[2] == max(this_call's target_lengths) + 1`
+                    #      (rnnt_pytorch.py:634) — run_12 hit this with
+                    #      "Output length mismatch! Given U: 193, Expected max U
+                    #       from target lengths: 76 + 1" when one sample's true U
+                    #      was 76 but the global U pad was 192.
+                    # So re-truncate to the CHUNK's own max lengths inside the loop.
+                    chunk_losses = []
+                    chunk_sample_counts = []
+                    for start in range(0, n_kept, chunk_size):
+                        end = min(start + chunk_size, n_kept)
+                        c_tgt = targets[start:end]
+                        c_tgt_lens = target_lengths[start:end]
+                        c_enc = encoder_outputs[start:end]
+                        c_enc_lens = encoder_lengths[start:end]
+                        # Per-chunk target-length truncation: required for correctness
+                        # (certify_inputs) AND helpful for memory (joint.shape[2] shrinks).
+                        c_max_u = int(c_tgt_lens.max().item())
+                        if c_max_u < c_tgt.shape[1]:
+                            c_tgt = c_tgt[:, :c_max_u].contiguous()
+                        # Per-chunk encoder-length truncation: optional for correctness
+                        # (RNNTLoss accepts any joint T >= max(input_lengths) via internal
+                        # narrow), but mandatory for memory — without it, chunk_size=1
+                        # still allocates the global T_max joint for every chunk.
+                        # encoder_outputs is (B, D, T) after the .transpose(1,2) above.
+                        c_max_t = int(c_enc_lens.max().item())
+                        if c_max_t < c_enc.shape[2]:
+                            c_enc = c_enc[:, :, :c_max_t].contiguous()
+                        c_dec, _, _ = self.rnnt_decoder(targets=c_tgt, target_length=c_tgt_lens)
+                        c_loss = self._rnnt_joint_and_loss(
+                            encoder_outputs=c_enc,
+                            decoder_outputs=c_dec,
+                            targets=c_tgt,
+                            encoder_lengths=c_enc_lens,
+                            target_lengths=c_tgt_lens,
+                            use_ckpt=use_ckpt,
+                        )
+                        chunk_losses.append(c_loss * (end - start))
+                        chunk_sample_counts.append(end - start)
+                    rnnt_loss_val = torch.stack(chunk_losses).sum() / float(sum(chunk_sample_counts))
+                loss = loss + self.cfg.get("rnnt_loss_weight", 1.0) * rnnt_loss_val
+
+                # ---- CTC auxiliary on the same encoder output (expN+) --------------
+                # Default-off (`use_ctc_loss=False`). When True, runs one cheap forward
+                # of `self.ctc_head` over the (B, D, T) encoder features that the RNNT
+                # branch just consumed, and adds CTC loss on the SAME BPE targets the
+                # RNNT branch BPE-encoded above. No chunking needed: CTC's (B, T, V+1)
+                # log-probs tensor is ~12x smaller than RNNT's (B, T, U+1, V+1) joint
+                # output, so the existing OOM-mitigation knobs (rnnt_loss_chunk_size,
+                # rnnt_loss_use_checkpoint) are not needed here.
+                #
+                # Why piggyback on the RNNT block: the targets/encoder_outputs/lengths
+                # tensors required by CTC are exactly those just built for RNNT
+                # (BPE-encoded source_texts, len-truncated `asr_emb` view, etc.). This
+                # avoids duplicating the per-sample tokenization + filtering + length
+                # truncation logic. As a result, the current implementation requires
+                # `use_rnnt_loss=true` whenever `use_ctc_loss=true`. A future CTC-only
+                # variant (expN_v3) will factor `_prepare_asr_targets()` into a
+                # standalone helper so CTC can run without RNNT.
+                #
+                # Hybrid invariant (asserted in __init__): the pretrained CTC head was
+                # trained on the SAME BPE vocabulary as the RNNT joint, so we feed it
+                # the same `targets` tensor without re-tokenizing.
+                if self.cfg.get("use_ctc_loss", False) and self.ctc_loss is not None:
+                    # ConvASRDecoder.forward returns log_softmax(...) already -- do NOT
+                    # apply log_softmax a second time. Input shape (B, D, T) matches the
+                    # `encoder_outputs` we just built (the .transpose(1, 2) line above).
+                    ctc_log_probs = self.ctc_head(encoder_output=encoder_outputs)
+                    # DTYPE FIX: torch's CUDA ctc_loss kernel (called by NeMo's CTCLoss
+                    # wrapper, asr/losses/ctc.py:77 -> F.ctc_loss -> torch.ctc_loss) is
+                    # NOT implemented for bf16:
+                    #   RuntimeError: "ctc_loss_cuda" not implemented for 'BFloat16'
+                    # Under precision=bf16-true the Conv1d inside ConvASRDecoder runs in
+                    # bf16, so its log_softmax output is bf16. Upcast to fp32 before
+                    # the loss call (the RNNT path is fine because RNNTLoss does its
+                    # own internal fp32 upcast of the joint logits, see
+                    # asr/losses/rnnt.py:467). The bf16 log_softmax already happened
+                    # at the encoder dtype -- 8-bit-exponent bf16 has plenty of
+                    # dynamic range for log-probs in [-log(V+1), 0] ~ [-9.5, 0], so
+                    # the upcast preserves accuracy.
+                    ctc_log_probs = ctc_log_probs.float()
+                    ctc_loss_val = self.ctc_loss(
+                        log_probs=ctc_log_probs,
+                        targets=targets,
+                        input_lengths=encoder_lengths,
+                        target_lengths=target_lengths,
+                    )
+                    loss = loss + self.cfg.get("ctc_loss_weight", 0.1) * ctc_loss_val
+        # -----------------------------------------------------------------------------------
+
         B, T = inputs["input_embeds"].shape[:2]
         ans = {
             "loss": loss,
@@ -1082,6 +1488,10 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
 
         if self.cfg.get("use_separate_asr_head", False):
             ans["asr_loss"] = asr_loss
+        if rnnt_loss_val is not None:
+            ans["rnnt_loss"] = rnnt_loss_val
+        if ctc_loss_val is not None:
+            ans["ctc_loss"] = ctc_loss_val
 
         self.log("batch_size", B, on_step=True, prog_bar=True, logger=True)
         self.log("sequence_length", T, on_step=True, prog_bar=True, logger=True)
@@ -1154,6 +1564,31 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             empty_user_text = self.empty_user_text.compute()
             for k, m in empty_user_text.items():
                 self.log(f"{prefix}_src_{k}", m.to(self.device), **_log_kw)
+
+        # Composite monitor metric: BLEU - 50 × WER.
+        # Unit: BLEU points. Maximising it simultaneously pushes BLEU up AND WER
+        # down, so checkpoint selection no longer ignores ASR quality. The factor
+        # 50 means a 1 pp absolute WER improvement is worth 0.5 BLEU points to the
+        # monitor -- conservative enough not to override large BLEU differences, but
+        # strong enough to break ties in favour of lower WER.
+        #
+        # Derivation: txt_bleu is in [0, 100] (sacrebleu corpus score); src txt_wer
+        # is a fraction in [0, 1] (e.g. 0.22 for 22%). Multiplying WER by 50 puts
+        # both on comparable scales when WER is in the 20-30% range typical of CVSS.
+        #
+        # Gated on predict_user_text: recipes that don't compute a source ASR head
+        # (e.g. AST-only ablations) fall back to composite = txt_bleu so they can
+        # still use MONITOR_METRIC="val_composite" without errors.
+        _bleu_agg = bleu.get("txt_bleu", torch.tensor(0.0)).to(self.device)
+        if self.predict_user_text and "txt_wer" in src_wer:
+            _wer_agg = src_wer["txt_wer"].to(self.device)   # fraction 0..1
+            _composite = _bleu_agg - 50.0 * _wer_agg
+        else:
+            _composite = _bleu_agg
+        self.log(
+            f"{prefix}_composite", _composite,
+            on_epoch=True, sync_dist=True, logger=True, prog_bar=True,
+        )
 
     def validation_step(self, batch: dict, batch_idx: int):
 
@@ -1333,7 +1768,16 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
         return hypotheses if hypotheses is not None else (previous_hypotheses or [])
 
     def _rnnt_hypotheses_to_src_text(self, hypotheses: list) -> list:
-        """Convert RNNT hypotheses to transcript strings. Normalize ▁ (U+2581) to space."""
+        """Convert RNNT hypotheses to transcript strings. Normalize ▁ (U+2581) to space.
+
+        BCP-47 language tags (e.g. ``<fr-FR>``, ``<es-US>``, ``<de-DE>``) that the
+        pretrained RNNT joint may emit from its multilingual vocabulary are KEPT here
+        on purpose, so they show up in validation JSON ``pred`` and ``[ASR RNNT]`` log
+        lines for observability (e.g. measuring tag-emission rate of expI/expJ). All
+        WER/BLEU metric paths strip them via ``normalize_for_metric`` in
+        ``results_logger.py``/``wer.py``/``bleu.py``/``asr_bleu.py``, so scoring is
+        unaffected (the ``pred_normalized`` field in JSON also remains tag-free).
+        """
         import re
         texts = []
         for hyp in hypotheses:

@@ -190,6 +190,86 @@ def setup_rnnt_decoder_joint(model: torch.nn.Module, model_path_or_name: str = N
     )
 
 
+def setup_ctc_decoder(model: torch.nn.Module, model_path_or_name: str = None):
+    """
+    Load the CTC head from a hybrid RNNT+CTC pretrained NeMo ASR checkpoint
+    (e.g. ``EncDecHybridRNNTCTCBPEModel``). The result is assigned to
+    ``model.ctc_head``.
+
+    Mirror of :func:`setup_rnnt_decoder_joint`. Loads the ``ctc_decoder``
+    sub-module (typically a ``ConvASRDecoder`` = single ``Conv1d(D, V+1)``
+    over the encoder output) plus its config from ``asr.cfg.aux_ctc.decoder``.
+    The shared BPE tokenizer is already loaded by ``setup_rnnt_decoder_joint``
+    (hybrid invariant: RNNT and CTC share the tokenizer); we re-use
+    ``model.rnnt_tokenizer`` and do not duplicate it.
+
+    Args:
+        model: The Lightning module (or any module with a ``cfg`` attribute).
+        model_path_or_name: Path to a ``.nemo`` ASR checkpoint. If ``None``,
+            falls back to ``model.cfg.get("pretrained_ctc_asr")`` and then to
+            ``model.cfg.get("pretrained_rnnt_asr")``. If neither is set, sets
+            ``model.ctc_head = None`` and returns.
+
+    Intended call site: only when ``model.cfg.use_ctc_loss=true`` (expN+).
+    Pre-expN recipes do not call this function, so they pay zero extra ASR
+    load and do not gain a ``ctc_head`` attribute.
+    """
+    path = model_path_or_name
+    if path is None:
+        path = model.cfg.get("pretrained_ctc_asr", None)
+    if path is None:
+        path = model.cfg.get("pretrained_rnnt_asr", None)
+    if not path:
+        model.ctc_head = None
+        return
+
+    asr = load_pretrained_nemo(ASRModel, path).eval()
+    if not (hasattr(asr, "ctc_decoder") and "aux_ctc" in asr.cfg):
+        logging.warning(
+            "Pretrained ASR at %s has no ctc_decoder/aux_ctc (got %s). "
+            "Not loading CTC head; model.ctc_head left as None.",
+            path,
+            type(asr).__name__,
+        )
+        model.ctc_head = None
+        return
+
+    # ConvASRDecoder requires either a positive num_classes or a vocabulary on
+    # the cfg; fill both from the live module before from_config_dict, mirroring
+    # the pattern used in setup_rnnt_decoder_joint above.
+    with open_dict(asr.cfg.aux_ctc.decoder):
+        if (
+            getattr(asr.cfg.aux_ctc.decoder, "vocabulary", None) is None
+            and hasattr(asr.ctc_decoder, "vocabulary")
+        ):
+            asr.cfg.aux_ctc.decoder.vocabulary = asr.ctc_decoder.vocabulary
+        if (
+            getattr(asr.cfg.aux_ctc.decoder, "num_classes", -1) is None
+            or asr.cfg.aux_ctc.decoder.get("num_classes", -1) < 1
+        ) and hasattr(asr.ctc_decoder, "vocabulary"):
+            asr.cfg.aux_ctc.decoder.num_classes = len(asr.ctc_decoder.vocabulary)
+
+    model.ctc_head = type(asr.ctc_decoder).from_config_dict(asr.cfg.aux_ctc.decoder)
+    asr_sd = asr.state_dict()
+    ctc_sd = {}
+    for k, v in asr_sd.items():
+        if k.startswith("ctc_decoder."):
+            ctc_sd["ctc_head." + k[len("ctc_decoder."):]] = v
+    # Note: mirrors setup_rnnt_decoder_joint above -- this NeMo LightningModule
+    # overrides ``load_state_dict`` to return ``None`` (instead of the standard
+    # torch.nn.Module ``_IncompatibleKeys`` namedtuple). Do not try to unpack
+    # the return value; rely on the strict=False semantics to apply our subset
+    # of keys and ignore the rest.
+    model.load_state_dict(ctc_sd, strict=False)
+    logging.info(
+        "Loaded CTC decoder from pretrained ASR checkpoint: %s "
+        "(num_classes_with_blank=%d, ctc_state_dict_keys=%d)",
+        path,
+        getattr(model.ctc_head, "num_classes_with_blank", -1),
+        len(ctc_sd),
+    )
+
+
 def set_model_dict_for_partial_init(pretrained_dict, model_dict):
     # 1. filter out different size layers
     for k, v in list(pretrained_dict.items()):

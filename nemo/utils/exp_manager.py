@@ -242,6 +242,10 @@ class ExpManagerConfig:
     # Checkpointing parameters
     create_checkpoint_callback: Optional[bool] = True
     checkpoint_callback_params: Optional[CallbackParams] = field(default_factory=lambda: CallbackParams())
+    # Optional extra ModelCheckpoint callbacks (e.g. save best-by-WER and best-by-BLEU
+    # in addition to the primary monitor). Each entry uses the same schema as
+    # checkpoint_callback_params; `dirpath` defaults to the primary callback's dirpath.
+    additional_checkpoint_callback_params: Optional[List[Dict[Any, Any]]] = None
     create_early_stopping_callback: Optional[bool] = False
     early_stopping_callback_params: Optional[EarlyStoppingParams] = field(
         default_factory=lambda: EarlyStoppingParams()
@@ -717,6 +721,12 @@ def exp_manager(trainer: 'lightning.pytorch.Trainer', cfg: Optional[Union[DictCo
             cfg.checkpoint_callback_params,
             cfg.create_preemption_callback,
         )
+        if cfg.get("additional_checkpoint_callback_params", None):
+            configure_additional_checkpointing(
+                trainer,
+                cfg.checkpoint_callback_params,
+                cfg.additional_checkpoint_callback_params,
+            )
 
     if cfg.disable_validation_on_resume:
         # extend training loop to skip initial validation when resuming from checkpoint
@@ -1408,6 +1418,40 @@ def configure_checkpointing(
             trainer.callbacks.append(preemption_callback)
         else:
             logging.info("Preemption is supported only on GPUs, disabling preemption")
+
+
+def configure_additional_checkpointing(
+    trainer: 'lightning.pytorch.Trainer',
+    primary_params: 'DictConfig',
+    additional_params_list: List[Dict[Any, Any]],
+):
+    """Append extra NeMoModelCheckpoint callbacks (multi-metric top-k saving).
+
+    The primary callback is already registered by ``configure_checkpointing``.
+    Each additional entry must specify at least ``monitor`` and ``mode``; use a
+    distinct ``filename`` prefix per entry so checkpoints do not overwrite each
+    other (e.g. ``step-ast``, ``step-wer``).
+    """
+    primary_dirpath = primary_params.get("dirpath")
+    if primary_dirpath is None and primary_params.get("filepath") is not None:
+        primary_dirpath = Path(primary_params.filepath).parent
+    for extra in additional_params_list:
+        params = OmegaConf.create(OmegaConf.to_container(primary_params, resolve=True))
+        with open_dict(params):
+            params.update(OmegaConf.create(extra))
+            if params.get("dirpath") is None and primary_dirpath is not None:
+                params.dirpath = primary_dirpath
+            if params.get("filename") is None:
+                params.filename = f"step-{params.get('monitor', 'metric')}"
+        logging.info(
+            "Additional checkpoint callback: monitor=%s mode=%s save_top_k=%s filename=%s",
+            params.get("monitor"),
+            params.get("mode"),
+            params.get("save_top_k", 1),
+            params.get("filename"),
+        )
+        checkpoint_callback = NeMoModelCheckpoint(n_resume=False, **params)
+        trainer.callbacks.append(checkpoint_callback)
 
 
 def check_slurm(trainer):

@@ -177,7 +177,7 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
             cuts.resample(self.target_sample_rate), roles=self.input_roles
         )
 
-        return {
+        batch = {
             "sample_id": [str(cut.id) for cut in cuts],
             "source_audio": source_audio,
             "source_audio_lens": source_audio_lens,
@@ -200,7 +200,34 @@ class DuplexS2SDatasetConcatV(torch.utils.data.Dataset):
             "first_turn_audio": first_turn_audio,
             "first_turn_audio_lens": first_turn_audio_lens,
             "formatter": [getattr(cut, "formatter", "s2s_duplex") for cut in cuts],
+            # Optional per-cut language tag (BCP-47, e.g. "fr-FR", "es-US", "de-DE").
+            #
+            # Populated by Lhotse's input_cfg `tags:` propagation
+            # (NeMo/nemo/collections/common/data/lhotse/cutset.py:attach_tags ->
+            # setattr(cut, key, val)). Adding a per-group `tags: {target_lang: <code>}`
+            # to the data YAML makes `cut.target_lang` available here. When the YAML
+            # group has no such tag, getattr returns None and the entry is None.
+            #
+            # CONSUMED BY (and only by): duplex_s2s_speech_decoder_model2.training_step,
+            # gated behind `model.rnnt_target_lang_suffix=true`. When that flag is False
+            # (the default in every existing config), the model never reads this field,
+            # so adding it here is byte-equivalent for expA-expI and any other recipe.
+            "target_lang": [getattr(cut, "target_lang", None) for cut in cuts],
         }
+
+        # ONE-SHOT DIAGNOSTIC (expJ_v3): verify Lhotse `tags: {target_lang: ...}`
+        # propagation by logging the first batch this worker sees. Auto-disables
+        # via a class-level flag so subsequent batches are silent. Safe for every
+        # recipe: when the data YAML has no `target_lang` tag the printed list
+        # will simply be all-None (which is itself useful as a baseline).
+        if not getattr(self.__class__, "_lang_probe_done", False):
+            self.__class__._lang_probe_done = True
+            logging.warning(
+                f"[TARGET_LANG_PROBE] sample_ids={[str(c.id) for c in cuts][:2]} "
+                f"target_lang={[getattr(c, 'target_lang', None) for c in cuts]}"
+            )
+
+        return batch
 
 
 def collate_first_turn_audio(
