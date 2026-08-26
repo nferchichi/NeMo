@@ -1026,7 +1026,17 @@ def check_resume(
                     checkpoint = last_checkpoints[0]
                     checkpoint = uninject_model_parallel_rank(checkpoint)
                 else:
-                    raise ValueError(f"Multiple checkpoints {last_checkpoints} that matches *last.ckpt.")
+                    # Multiple *-last.ckpt files accumulate across successive preemptions.
+                    # Pick the one with the highest step number rather than crashing.
+                    import re as _re
+                    def _step_of(p):
+                        m = _re.search(r'step=(\d+)', str(p))
+                        return int(m.group(1)) if m else -1
+                    checkpoint = max(last_checkpoints, key=_step_of)
+                    logging.warning(
+                        f"Multiple checkpoints match *last.ckpt: {last_checkpoints}. "
+                        f"Resuming from highest step: {checkpoint}"
+                    )
             else:
                 checkpoint = last_checkpoints[0]
 

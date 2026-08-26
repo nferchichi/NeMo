@@ -20,6 +20,8 @@ from peft import PeftModel
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from nemo.collections.asr.models import ASRModel
+from nemo.collections.asr.modules import RNNTDecoder, RNNTJoint
+from nemo.collections.common.tokenizers.sentencepiece_tokenizer import SentencePieceTokenizer
 from nemo.collections.speechlm2.modules import AudioPerceptionModule
 
 from nemo.collections.speechlm2.parts.precision import fp32_precision
@@ -93,29 +95,67 @@ def setup_speech_encoder(model: torch.nn.Module):
     with a pretrained NeMo ``ASRModel``.
     The result is assigned to ``model.perception`` attribute and is trainable.
 
+    Fast path: if ``model.cfg.pretrained_asr_weights`` points to a pre-extracted .pt file
+    (created by extract_asr_weights.py), loads tensors directly without NeMo restore_from().
+    This avoids the abstract-ASRModel instantiation error that occurs when loading some
+    pretrained models (e.g. nemotron via HuggingFace name or .nemo path).
+
+    Slow path (fallback): full NeMo restore_from() via ``model.cfg.pretrained_asr``.
+
     If user config specifies encoder parameters, they will override the pretrained model's config.
     """
+    from pathlib import Path as _Path
+
     user_encoder_config = {}
     if "encoder" in model.cfg.perception:
         user_encoder_config = OmegaConf.to_container(model.cfg.perception.encoder, resolve=True)
 
-    asr = load_pretrained_nemo(ASRModel, model.cfg.pretrained_asr).eval()
-    with open_dict(model.cfg):
-        model.cfg.perception.preprocessor = asr.cfg.preprocessor
-        model.cfg.perception.encoder = asr.cfg.encoder
-        model.cfg.perception.output_dim = model.llm.config.hidden_size
-        if user_encoder_config:
-            for key, value in user_encoder_config.items():
-                if value is not None:
-                    model.cfg.perception.encoder[key] = value
-            # Pretrained ASR encoder may set att_context_probs for multiple att_context_size modes.
-            if user_encoder_config.get("att_context_size") is not None:
-                enc_cfg = model.cfg.perception.encoder
-                if OmegaConf.select(enc_cfg, "att_context_probs") is not None:
-                    with open_dict(model.cfg.perception):
-                        del model.cfg.perception.encoder["att_context_probs"]
-    model.perception = AudioPerceptionModule(model.cfg.perception).train()
-    model.perception.load_state_dict(asr.state_dict(), strict=False)
+    pretrained_weights_path = getattr(model.cfg, 'pretrained_asr_weights', None)
+
+    if pretrained_weights_path and _Path(pretrained_weights_path).exists():
+        # Fast path: pre-extracted encoder+preprocessor weights + embedded config YAML.
+        logging.info(f"Loading pre-extracted ASR weights from {pretrained_weights_path}")
+        bundle = torch.load(pretrained_weights_path, map_location="cpu", weights_only=False)
+        asr_state_dict = bundle["state_dict"]
+        full_cfg = OmegaConf.create(bundle["model_config_yaml"])
+        asr_preprocessor_cfg = full_cfg.preprocessor
+        asr_encoder_cfg = full_cfg.encoder
+        with open_dict(model.cfg):
+            model.cfg.perception.preprocessor = asr_preprocessor_cfg
+            model.cfg.perception.encoder = asr_encoder_cfg
+            model.cfg.perception.output_dim = model.llm.config.hidden_size
+            # Override feat_in to match the ASR encoder's output dimension (d_model).
+            encoder_out_dim = int(asr_encoder_cfg.get('d_model', 1024))
+            model.cfg.perception.modality_adapter.feat_in = encoder_out_dim
+            if user_encoder_config:
+                for key, value in user_encoder_config.items():
+                    if value is not None:
+                        model.cfg.perception.encoder[key] = value
+                if user_encoder_config.get("att_context_size") is not None:
+                    enc_cfg = model.cfg.perception.encoder
+                    if OmegaConf.select(enc_cfg, "att_context_probs") is not None:
+                        with open_dict(model.cfg.perception):
+                            del model.cfg.perception.encoder["att_context_probs"]
+        model.perception = AudioPerceptionModule(model.cfg.perception).train()
+        model.perception.load_state_dict(asr_state_dict, strict=False)
+    else:
+        asr = load_pretrained_nemo(ASRModel, model.cfg.pretrained_asr).eval()
+        with open_dict(model.cfg):
+            model.cfg.perception.preprocessor = asr.cfg.preprocessor
+            model.cfg.perception.encoder = asr.cfg.encoder
+            model.cfg.perception.output_dim = model.llm.config.hidden_size
+            if user_encoder_config:
+                for key, value in user_encoder_config.items():
+                    if value is not None:
+                        model.cfg.perception.encoder[key] = value
+                # Pretrained ASR encoder may set att_context_probs for multiple att_context_size modes.
+                if user_encoder_config.get("att_context_size") is not None:
+                    enc_cfg = model.cfg.perception.encoder
+                    if OmegaConf.select(enc_cfg, "att_context_probs") is not None:
+                        with open_dict(model.cfg.perception):
+                            del model.cfg.perception.encoder["att_context_probs"]
+        model.perception = AudioPerceptionModule(model.cfg.perception).train()
+        model.perception.load_state_dict(asr.state_dict(), strict=False)
 
 
 def setup_rnnt_decoder_joint(model: torch.nn.Module, model_path_or_name: str = None):
@@ -127,12 +167,82 @@ def setup_rnnt_decoder_joint(model: torch.nn.Module, model_path_or_name: str = N
     Call this after ``setup_speech_encoder`` if you want to use the RNNT head (e.g. for
     decoding). The path can be the same as ``pretrained_asr`` or a different checkpoint.
 
+    Fast path: if ``model.cfg.pretrained_rnnt_weights`` points to a pre-extracted .pt
+    bundle (created by extract_rnnt_decoder_joint_weights.py: decoder/joint state dicts +
+    configs + tokenizer model path), loads directly without NeMo restore_from(). This
+    mirrors setup_speech_encoder's pretrained_asr_weights fast path and exists for the
+    same reason: it avoids the abstract-ASRModel instantiation error that occurs when
+    loading some pretrained models (e.g. nemotron via HuggingFace name or .nemo path).
+
+    Slow path (fallback): full NeMo restore_from()/from_pretrained() via
+    ``model.cfg.pretrained_rnnt_asr``.
+
     Args:
         model: The DuplexSTTModel (or any module with a ``cfg`` attribute).
         model_path_or_name: Path to a ``.nemo`` ASR checkpoint. If ``None``, uses
             ``model.cfg.get("pretrained_rnnt_asr")``. If that is not set, sets
             ``model.rnnt_decoder`` and ``model.rnnt_joint`` to ``None`` and returns.
     """
+    pretrained_rnnt_weights_path = getattr(model.cfg, 'pretrained_rnnt_weights', None)
+    if pretrained_rnnt_weights_path and Path(pretrained_rnnt_weights_path).exists():
+        logging.info(f"Loading pre-extracted RNNT decoder/joint weights from {pretrained_rnnt_weights_path}")
+        bundle = torch.load(pretrained_rnnt_weights_path, map_location="cpu", weights_only=False)
+        decoder_cfg = OmegaConf.create(bundle["decoder_config"])
+        joint_cfg = OmegaConf.create(bundle["joint_config"])
+        model.rnnt_decoder = RNNTDecoder.from_config_dict(decoder_cfg)
+        model.rnnt_joint = RNNTJoint.from_config_dict(joint_cfg)
+        rnnt_sd = {}
+        for k, v in bundle["state_dict"].items():
+            if k.startswith("decoder."):
+                rnnt_sd["rnnt_decoder." + k[len("decoder."):]] = v
+            elif k.startswith("joint."):
+                rnnt_sd["rnnt_joint." + k[len("joint."):]] = v
+        model.load_state_dict(rnnt_sd, strict=False)
+        tokenizer_model_path = bundle.get("tokenizer_model_path")
+        if tokenizer_model_path and Path(tokenizer_model_path).exists():
+            model.rnnt_tokenizer = SentencePieceTokenizer(model_path=tokenizer_model_path)
+            # A bare SentencePieceTokenizer is missing several attributes that
+            # ASRBPEMixin._setup_monolingual_tokenizer() / _derive_tokenizer_properties()
+            # (nemo/collections/asr/parts/mixins/mixins.py) normally attach right after
+            # construction, and that RNNTBPEDecoding.__init__ (called from
+            # offline_inference() during validation_step, NOT at model-construction time)
+            # reads unconditionally:
+            #   - tokenizer.tokenizer.vocab_size / .get_vocab / .all_special_tokens
+            #     monkey-patched onto the *raw* SentencePieceProcessor (its own native
+            #     .vocab_size is a bound method, not an int -- accessing it unmodified
+            #     raises "TypeError: unsupported operand type(s) for +: 'method' and 'int'"
+            #     in rnnt_greedy_decoding.py's blank-id arithmetic).
+            #   - tokenizer.supported_punctuation / .supports_capitalization, derived
+            #     from the vocabulary (missing -> AttributeError in RNNTBPEDecoding.__init__).
+            # Because this only fires inside validation_step, a quick max_steps smoke
+            # test with validation disabled won't catch either failure -- both were
+            # found by crashing an actual training run at its first validation
+            # checkpoint, then reproduced with a smoke test that enables validation.
+            vocabulary = {}
+            for i in range(model.rnnt_tokenizer.vocab_size):
+                piece = model.rnnt_tokenizer.ids_to_tokens([i])[0]
+                vocabulary[piece] = i + 1
+
+            def _get_vocab(_vocabulary=vocabulary):
+                return _vocabulary
+
+            model.rnnt_tokenizer.tokenizer.vocab_size = len(vocabulary)
+            model.rnnt_tokenizer.tokenizer.get_vocab = _get_vocab
+            model.rnnt_tokenizer.tokenizer.all_special_tokens = model.rnnt_tokenizer.special_token_to_id
+
+            import unicodedata
+            capitalized_tokens = {token.strip() for token in vocabulary if any(char.isupper() for char in token)}
+            model.rnnt_tokenizer.supports_capitalization = bool(capitalized_tokens)
+            punctuation = {char for token in vocabulary for char in token if unicodedata.category(char).startswith('P')}
+            model.rnnt_tokenizer.supported_punctuation = punctuation
+            logging.info(
+                "Loaded RNNT BPE tokenizer from pre-extracted bundle for RNNT BPE decoding (ids_to_text): %s",
+                tokenizer_model_path,
+            )
+        else:
+            model.rnnt_tokenizer = None
+        return
+
     path = model_path_or_name
     if path is None:
         path = model.cfg.get("pretrained_rnnt_asr", None)

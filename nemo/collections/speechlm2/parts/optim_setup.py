@@ -84,6 +84,28 @@ def configure_optimizers(model: LightningModule):
         )
         optimizer = hydra.utils.instantiate(model.cfg.optimizer, param_groups, _convert_='all')
 
+    # Defense-in-depth: verify no `requires_grad=False` parameter ended up inside
+    # any optimizer param group (which would make it eligible for weight decay /
+    # momentum-driven updates despite being "frozen"). This is a static structural
+    # check independent of `freeze_and_subset`/`build_param_groups`'s own logic, so
+    # it will catch a regression in either of those functions, a bad `keep_patterns`
+    # override, or any future refactor that accidentally reintroduces frozen params
+    # into the optimizer.
+    assert_frozen_params_excluded_from_optimizer(model, optimizer)
+
+    # NOTE: the frozen-parameter fingerprint snapshot used to be taken HERE, but
+    # `configure_optimizers()` runs *before* the trainer's strategy finishes
+    # wrapping the model (DDP's constructor does a one-time, value-preserving
+    # broadcast of rank 0's parameters/buffers to every other rank, and other
+    # one-time device/precision materialization can also happen after this
+    # point). Snapshotting this early produced spurious "drift" reports for
+    # hundreds of parameters at the very first checkpoint save -- a false
+    # positive from comparing against a pre-setup baseline, not real training-
+    # induced mutation (confirmed via a live instrumented repro: the same
+    # parameters showed zero drift when snapshotted at `on_fit_start` instead).
+    # The real snapshot now happens in `DuplexS2SSpeechDecoderModel2.on_fit_start`
+    # (see that method), which runs after strategy/DDP setup completes.
+
     ans = {"optimizer": optimizer}
     if "lr_scheduler" in model.cfg:
         lr_scheduler = hydra.utils.instantiate(model.cfg.lr_scheduler, optimizer)
@@ -298,3 +320,83 @@ def freeze_and_subset(
 
 def is_frozen(module: torch.nn.Module) -> bool:
     return all(not p.requires_grad for p in module.parameters())
+
+
+# ---------------------------------------------------------------------------
+# Frozen-parameter integrity checks.
+#
+# `freeze_and_subset`/`build_param_groups` already correctly exclude every
+# `requires_grad=False` parameter from the optimizer's param groups, so those
+# parameters should never be touched by `optimizer.step()` (no gradient descent,
+# no weight decay, no momentum). The two helpers below add a second, independent
+# line of defense: a structural check that no frozen param leaked into the
+# optimizer despite that logic, and a value-level fingerprint check that proves
+# frozen params truly stayed bit-for-bit unchanged across training -- regardless
+# of *how* an unwanted update might occur (a future refactor of the freeze logic,
+# an unrelated callback writing into `state_dict()`, a DDP/bucket-view aliasing
+# issue, etc.). Catching drift here, at checkpoint-save time, is far cheaper than
+# discovering it later via degraded downstream eval metrics.
+# ---------------------------------------------------------------------------
+
+
+def assert_frozen_params_excluded_from_optimizer(model: LightningModule, optimizer: torch.optim.Optimizer) -> None:
+    """
+    Raise if any `requires_grad=False` parameter is present in any of the
+    optimizer's param groups. A frozen parameter has no gradient, so it should
+    never have been added to a group in the first place.
+    """
+    optimizer_param_ids = {id(p) for group in optimizer.param_groups for p in group["params"]}
+    leaked = [name for name, p in model.named_parameters() if not p.requires_grad and id(p) in optimizer_param_ids]
+    if leaked:
+        raise RuntimeError(
+            f"{len(leaked)} frozen parameter(s) (requires_grad=False) were found inside the "
+            f"optimizer's param groups -- they would be subject to weight decay / momentum "
+            f"updates despite being marked frozen. First few: {leaked[:10]}. This indicates a "
+            f"bug in freeze_and_subset/build_param_groups or their caller."
+        )
+
+
+def _tensor_fingerprint(t: torch.Tensor) -> int:
+    """
+    Cheap, exact (bit-level) fingerprint of a tensor's current values. Works
+    uniformly across dtypes (bf16/fp16/fp32/...) by hashing the raw byte
+    representation, so it can't be fooled by NaN/Inf-related equality quirks
+    and needs no dtype-specific handling. Not cryptographically collision-proof,
+    but astronomically unlikely to collide for real (non-adversarial) model
+    weight drift, and O(1) memory per tensor (no full clone retained).
+    """
+    with torch.no_grad():
+        byte_view = t.detach().reshape(-1).contiguous().cpu().view(torch.uint8).to(torch.int64)
+        n = byte_view.numel()
+        # Position-weighted sum so a byte-order permutation can't hide a change.
+        weights = torch.arange(1, n + 1, dtype=torch.int64)
+        return int((byte_view * weights).sum().item())
+
+
+def snapshot_frozen_param_fingerprints(model: LightningModule) -> dict[str, int]:
+    """Return {param_name: fingerprint} for every currently-frozen parameter."""
+    return {name: _tensor_fingerprint(p) for name, p in model.named_parameters() if not p.requires_grad}
+
+
+def verify_frozen_params_unchanged(model: LightningModule, snapshot: dict[str, int]) -> list[str]:
+    """
+    Recompute fingerprints for every parameter name in ``snapshot`` and return
+    the list of names whose fingerprint no longer matches (i.e. drifted).
+    Empty list means all frozen parameters are still bit-for-bit unchanged.
+    Parameters that no longer exist or are no longer frozen are skipped with a
+    warning rather than silently ignored, so an unexpected architecture change
+    doesn't quietly disable the check.
+    """
+    current = dict(model.named_parameters())
+    drifted: list[str] = []
+    for name, old_fp in snapshot.items():
+        p = current.get(name)
+        if p is None:
+            logging.warning(f"[frozen-param-check] '{name}' no longer exists on the model; skipping.")
+            continue
+        if p.requires_grad:
+            logging.warning(f"[frozen-param-check] '{name}' is no longer frozen (requires_grad=True); skipping.")
+            continue
+        if _tensor_fingerprint(p) != old_fp:
+            drifted.append(name)
+    return drifted

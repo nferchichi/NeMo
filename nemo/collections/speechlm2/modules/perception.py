@@ -75,6 +75,16 @@ class AudioPerceptionModule(NeuralModule, Exportable):
             self.modality_adapter_vector_quantizer = FiniteScalarQuantizer(self.modality_adapter_quantizer_levels)
             self.modality_adapter_quantizer_projection = nn.Linear(bottleneck_dim, cfg.modality_adapter.d_model)
 
+        # Optional ASR-specific adapter between the frozen encoder and the RNNT branch.
+        # The existing modality_adapter is the AST adapter (encoder → LLM) and must remain
+        # completely untouched.  This adapter (when configured) receives the raw encoder
+        # output (B, D_enc, T) and produces a transformed representation that feeds the
+        # RNNT decoder+joint instead of the bare encoder output.  It is only exercised
+        # when return_encoder_emb=True (training_step and streaming-inference loop).
+        self.asr_adapter = None
+        if cfg.get('asr_adapter') is not None:
+            self.asr_adapter = self.from_config_dict(cfg.asr_adapter)
+
     def maybe_preprocess_audio(
         self,
         input_signal=None,
@@ -129,6 +139,12 @@ class AudioPerceptionModule(NeuralModule, Exportable):
         # b, c, t -> b, t, c
         encoded = self.proj(encoded.transpose(1, 2))
         if return_encoder_emb:
+            if self.asr_adapter is not None:
+                # Route raw encoder output through the ASR-specific adapter.
+                # encoder_emb is (B, D_enc, T); asr_adapter receives and returns (B, D_enc, T).
+                # encoded_len equals the encoder output length (both adapters use subsampling_factor=1).
+                asr_enc, _ = self.asr_adapter(audio_signal=encoder_emb, length=encoded_len)
+                return encoded, encoded_len, asr_enc.transpose(1, 2)
             return encoded, encoded_len, encoder_emb.transpose(1, 2)
         else:
             return encoded, encoded_len

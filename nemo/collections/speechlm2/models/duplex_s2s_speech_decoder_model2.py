@@ -54,7 +54,7 @@ from nemo.collections.speechlm2.parts.metrics.wer import WER
 from nemo.collections.speechlm2.parts.metrics.results_logger import ResultsLogger
 from nemo.collections.speechlm2.parts.metrics.token_accuracy import TokenAccuracy
 from nemo.collections.speechlm2.parts.metrics.empty_text import EmptyTextMetric
-from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen
+from nemo.collections.speechlm2.parts.optim_setup import configure_optimizers, is_frozen, verify_frozen_params_unchanged
 from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.speechlm2.parts.pretrained import (
     load_pretrained_hf,
@@ -219,6 +219,13 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
         #       messing up FSDP/TP hooks.
         self.embed_tokens = self.llm.embed_tokens            
 
+        if self.cfg.get("use_separate_asr_head", False):
+            assert self.cfg.get("is_conv", False), (
+                "use_separate_asr_head=True requires is_conv=True; "
+                "otherwise asr_labels (source-language text) would be fed to the TTS decoder as "
+                "target_text_tokens instead of translation labels."
+            )
+
         if self.cfg.get("predict_user_text", False) or self.cfg.get("use_separate_asr_head", False):
             self.asr_head = copy.deepcopy(self.lm_head)
             self.embed_asr_tokens = copy.deepcopy(self.embed_tokens)
@@ -329,19 +336,11 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             llm_tokenizer_vocab_items=llm_tokenizer_vocab_items,
         )
 
-        if self.cfg.get("pretrained_s2s_model", None):
-            logging.info(f"Loading pretrained s2s model from {self.cfg.pretrained_s2s_model}")
-            self.init_from_model_from_ckpt(self.cfg.pretrained_s2s_model)
-
-        # load pretrained TTS model
-        if self.cfg.get("pretrained_tts", None):
-            self.init_speech_generation_from_tts_checkpoint(self.cfg.pretrained_tts)
-
-        # load speech decoder/speech generation module from another checkpoint
-        
-        if self.cfg.get("pretrained_tts_from_s2s", None):
-            self.init_speech_generation_from_another_s2s_checkpoint(self.cfg.pretrained_tts_from_s2s)
-
+        # Constructed before any pretrained-checkpoint restore below (pretrained_s2s_model,
+        # pretrained_tts, pretrained_tts_from_s2s) so that init_from_model_from_ckpt's
+        # partial-init (which filters restored keys by `k in self.state_dict()`) can see
+        # and restore these modules' trained weights instead of silently skipping them
+        # because they didn't exist yet at restore time.
         self.embed_audio_tokens = torch.nn.ModuleList(
             [
                 torch.nn.Embedding(self.speech_vocab_size, self.embed_tokens.embedding_dim)
@@ -349,6 +348,47 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             ]
         )
         self.audio_head = torch.nn.Linear(self.llm.config.hidden_size, self.speech_vocab_size * self._num_codebooks)
+
+        s2s_model_loaded = bool(self.cfg.get("pretrained_s2s_model", None))
+        if s2s_model_loaded:
+            logging.info(f"Loading pretrained s2s model from {self.cfg.pretrained_s2s_model}")
+            self.init_from_model_from_ckpt(self.cfg.pretrained_s2s_model)
+
+        # load pretrained TTS model
+        #
+        # Skipped when pretrained_s2s_model was already loaded above: that restore already
+        # populates self.speech_generation (e.g. from a fine-tuned checkpoint like
+        # step=17005.ckpt), and unconditionally applying pretrained_tts/pretrained_tts_from_s2s
+        # afterward would silently clobber those weights with a generic/unrelated TTS
+        # checkpoint's values. This previously happened in production (rnnt-asr-adapter
+        # training configs set both pretrained_s2s_model and pretrained_tts_from_s2s), and
+        # was misdiagnosed for a long time as live weight drift during training, when in
+        # fact speech_generation.* was silently overwritten once, here, at construction time
+        # -- before any training step ran. If you genuinely need to load speech_generation
+        # from a *different* checkpoint than pretrained_s2s_model, do not also set
+        # pretrained_s2s_model.
+        if self.cfg.get("pretrained_tts", None):
+            if s2s_model_loaded:
+                logging.warning(
+                    "cfg.pretrained_tts is set but ignored because pretrained_s2s_model was "
+                    "already loaded above and already provides speech_generation weights. "
+                    "Unset pretrained_s2s_model if you intend to override speech_generation "
+                    "from cfg.pretrained_tts."
+                )
+            else:
+                self.init_speech_generation_from_tts_checkpoint(self.cfg.pretrained_tts)
+
+        # load speech decoder/speech generation module from another checkpoint
+        if self.cfg.get("pretrained_tts_from_s2s", None):
+            if s2s_model_loaded:
+                logging.warning(
+                    "cfg.pretrained_tts_from_s2s is set but ignored because pretrained_s2s_model "
+                    "was already loaded above and already provides speech_generation weights. "
+                    "Unset pretrained_s2s_model if you intend to override speech_generation "
+                    "from cfg.pretrained_tts_from_s2s."
+                )
+            else:
+                self.init_speech_generation_from_another_s2s_checkpoint(self.cfg.pretrained_tts_from_s2s)
 
         # cached for quicker audio decoding
         self.register_buffer(
@@ -789,10 +829,6 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
                     f"This may indicate significant desynchronization in longer sessions."
                 )
 
-        btt = target_tokens[..., None]
-        target_codes = torch.where(btt == self.text_bos_id, self.speech_bos_id, target_codes)
-        target_codes = torch.where(btt == self.text_eos_id, self.speech_eos_id, target_codes)
-
         # ToDo: implement in a way that we can set the number of speech delay > 1
         target_codes = torch.cat(
             [
@@ -822,11 +858,20 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             target_tokens = delay_eos(target_tokens, self.text_eos_id, self.text_pad_id, shift=self.cfg.delay_text_eos_by)
 
         if self.predict_user_text:
-            source_tokens = batch["source_tokens"]
+            # NOTE: do NOT re-read batch["source_tokens"] here.  source_tokens was
+            # already aligned to source_encoded / target_codes length at lines above.
+            # Re-reading the raw batch tensor would discard that alignment and could
+            # silently over-truncate source_encoded / asr_emb on edge-case batches.
             user_bos_id = self.user_bos_id
             user_eos_id = self.user_eos_id
 
             if source_tokens.shape != target_tokens.shape:
+                logging.warning(
+                    "predict_user_text: source_tokens (%s) and target_tokens (%s) shapes differ "
+                    "after alignment — trimming to min_len.  This should not happen; investigate "
+                    "the upstream alignment logic if this fires frequently.",
+                    source_tokens.shape, target_tokens.shape,
+                )
                 min_len = min(source_tokens.shape[1], target_tokens.shape[1])
                 source_tokens = source_tokens[:, :min_len]
                 target_tokens = target_tokens[:, :min_len]
@@ -834,7 +879,7 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
                 source_encoded = source_encoded[:, :min_len]
                 asr_emb = asr_emb[:, :min_len]
 
-            # Optionally delay the prediction of source_tokens by a flag
+            # Optionally delay the prediction of source_tokens by a fixed number of frames.
             delay_source_text_by = self.cfg.get("delay_source_text_by", 0)
             if delay_source_text_by > 0:
                 pad = torch.full(
@@ -844,8 +889,11 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
                     dtype=torch.long,
                 )
                 source_tokens_delayed = torch.cat([pad, source_tokens[:, :-delay_source_text_by]], dim=-1)
-                # Add back user_eos_id since it may be truncated
+                # Restore the user_eos marker at the last frame (may have been truncated by the shift).
                 source_tokens_delayed[:, -1] = user_eos_id
+            else:
+                # No delay: source tokens are used as-is.
+                source_tokens_delayed = source_tokens.clone()
 
             source_tokens_flat = source_tokens_delayed.clone()
             target_tokens_flat = target_tokens.clone()
@@ -892,6 +940,16 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             target_tokens = torch.where(mask, source_tokens_flat, target_tokens_flat)
             # logging.info(f"target_tokens[0] w/ delay of {delay_source_text_by}: {target_tokens[0]}")
 
+        # Stamp speech_bos/speech_eos into target_codes at the positions where the text channel
+        # carries text_bos/text_eos.  Must happen AFTER the predict_user_text block so that
+        # target_tokens_flat already reflects the mutated EOS position (Fm), keeping audio_labels
+        # and text_labels consistent.  When predict_user_text is disabled, target_tokens_flat is
+        # not defined and we fall back to target_tokens (no mutation occurred).
+        _stamp_src = target_tokens_flat if self.predict_user_text else target_tokens
+        btt = _stamp_src[..., None]
+        target_codes = torch.where(btt == self.text_bos_id, self.speech_bos_id, target_codes)
+        target_codes = torch.where(btt == self.text_eos_id, self.speech_eos_id, target_codes)
+
         input_ids = torch.cat([target_codes, target_tokens[..., None]], dim=-1)
         if self._use_tp:
             tp_world_size = self.device_mesh["tensor_parallel"].size()
@@ -921,8 +979,9 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             asr_inputs = asr_ids[:, :-1]
             asr_labels = asr_ids[:, 1:]
             if not self.cfg.get("force_use_asr_head_for_user_agent_text", False):
-                text_inputs = target_tokens_flat[:, :-1]
-                text_labels = target_tokens_flat[:, 1:]
+                _text_src = target_tokens_flat if self.predict_user_text else target_tokens
+                text_inputs = _text_src[:, :-1]
+                text_labels = _text_src[:, 1:]
 
         audio_inputs = input_ids[:, :-1, :-1]  # (B, T-1, K)
         audio_labels = input_ids[:, 1:, :-1]  # (B, T-1, K)
@@ -1248,7 +1307,13 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
 
         loss = self.cfg.text_loss_weight * text_loss + self.cfg.audio_loss_weight * audio_loss
         if self.cfg.get("use_separate_asr_head", False):
-            loss = loss + self.cfg.get('asr_loss_weight', 1.0) * asr_loss
+            # Default is 0 (not 1): forgetting to set asr_loss_weight must be safe.
+            # A non-zero weight with a frozen asr_head would backprop gradient through the
+            # frozen projection into last_hidden_state, silently pushing the LLM toward
+            # source-language transcription.
+            _asr_loss_weight = self.cfg.get('asr_loss_weight', 0.0)
+            if _asr_loss_weight > 0:
+                loss = loss + _asr_loss_weight * asr_loss
 
         # ---- Optional RNNT-loss side objective (expI+) -----------------------------------
         # Gated on `use_rnnt_loss` (default False). When the gate is False this block is a
@@ -1479,6 +1544,11 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             "loss": loss,
             "learning_rate": (
                 torch.as_tensor(self.trainer.optimizers[0].param_groups[0]['lr'] if self._trainer is not None else 0)
+            ),
+            "learning_rate_encoder": (
+                torch.as_tensor(self.trainer.optimizers[0].param_groups[1]['lr'] if (
+                    self._trainer is not None and len(self.trainer.optimizers[0].param_groups) > 1
+                ) else 0)
             ),
             "text_loss": text_loss,
             "audio_loss": audio_loss,
@@ -2015,11 +2085,16 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             # --- EOS tracking ---
             speech_done = (gen_audio[:, t] == self.speech_eos_id).any(dim=1)
             text_done = (gen_text[:, t] == self.text_eos_id)
-            asr_step_done = (
-                (gen_asr[:, t] == self.user_eos_id)
-                if track_asr_logits
-                else torch.zeros(B, dtype=torch.bool, device=self.device)
-            )
+            if do_rnnt_in_loop:
+                # RNNT is the active transcription path: declare "asr done" once all valid
+                # encoder frames for each batch item have been consumed.  The frozen asr_head
+                # (never trained when asr_loss_weight=0) cannot reliably predict user_eos_id,
+                # so using gen_asr EOS here would cause the loop to always run to T.
+                asr_step_done = lengths.to(self.device) <= t
+            elif track_asr_logits:
+                asr_step_done = gen_asr[:, t] == self.user_eos_id
+            else:
+                asr_step_done = torch.zeros(B, dtype=torch.bool, device=self.device)
 
             newly_speech_done = (~audio_done) & (speech_done)
             newly_text_done = (~txt_done) & (text_done)
@@ -2142,7 +2217,134 @@ class DuplexS2SSpeechDecoderModel2(LightningModule, HFHubMixin):
             super().backward(*args, **kwargs)
 
     def configure_optimizers(self):
-        return configure_optimizers(self)
+        result = configure_optimizers(self)
+        # Log frozen / trainable parameter counts once at optimizer construction time.
+        # This fires before training begins and is always useful regardless of experiment.
+        n_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        n_frozen = sum(p.numel() for p in self.parameters() if not p.requires_grad)
+        logging.info(
+            "Parameter budget — trainable: %s (%.1f M)  frozen: %s (%.1f M)",
+            f"{n_trainable:,}",
+            n_trainable / 1e6,
+            f"{n_frozen:,}",
+            n_frozen / 1e6,
+        )
+        if self.cfg.get("log_rnnt_grad_norms", False):
+            # Print per-module trainable param counts as a quick sanity check.
+            for tag, mod in [
+                ("perception.asr_adapter", getattr(getattr(self, "perception", None), "asr_adapter", None)),
+                ("rnnt_decoder", getattr(self, "rnnt_decoder", None)),
+                ("rnnt_joint", getattr(self, "rnnt_joint", None)),
+            ]:
+                if mod is not None:
+                    n = sum(p.numel() for p in mod.parameters() if p.requires_grad)
+                    logging.info("  %s trainable params: %s (%.2f M)", tag, f"{n:,}", n / 1e6)
+        return result
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        """
+        Snapshot frozen-parameter fingerprints for `on_save_checkpoint`'s
+        integrity check, once (after the first optimizer step of this run/resume).
+
+        NOT done in `configure_optimizers()` or `on_fit_start()` (both tried and
+        reverted): `speech_generation.speaker_encoder.*` and `audio_codec.*` are
+        each restored from an external pretrained checkpoint at construction time
+        (nemo.collections.speechlm2.modules.speech_generation.py's from_pretrained
+        call for the former; the audio codec's own restore for the latter), then
+        correctly overwritten by the `pretrained_s2s_model` (step=17005.ckpt)
+        restore -- but empirically (confirmed via a live instrumented 2-GPU repro,
+        `frozen_param_diag/`) something re-triggers a second restore of those two
+        specific submodules from their original external sources shortly after,
+        before the first training step. This second restore is harmless in
+        practice -- the real production checkpoint (step=14002.ckpt) shows these
+        submodules end up byte-identical to step=17005.ckpt -- but it makes any
+        snapshot taken before it look like 752 parameters "mutated" the moment
+        training starts, even though nothing outside speaker_encoder/audio_codec
+        was actually touched (verified: those 752 names are exactly
+        audio_codec.* + speech_generation.speaker_encoder.*, zero overlap with
+        cas_encoder/t5_decoder/final_proj/audio_embeddings, the submodules that
+        DO drift for real over a full training run). Snapshotting after the
+        first full training step (forward+backward+optimizer.step()) sidesteps
+        this early, self-resolving artifact while still starting well before
+        the ~14k-step point where the real drift was observed to have occurred.
+        """
+        if getattr(self, "_frozen_param_fingerprints", None) is None and self.trainer is not None:
+            from nemo.collections.speechlm2.parts.optim_setup import snapshot_frozen_param_fingerprints
+
+            self._frozen_param_fingerprints = snapshot_frozen_param_fingerprints(self)
+            logging.info(
+                f"Frozen-parameter integrity snapshot recorded for {len(self._frozen_param_fingerprints)} "
+                f"parameter tensor(s) after step {self.trainer.global_step}; will be re-checked before "
+                "every checkpoint save."
+            )
+
+    def on_save_checkpoint(self, checkpoint):
+        """
+        Integrity check: every parameter that `configure_optimizers` marked as
+        frozen (requires_grad=False) must still be bit-for-bit identical to its
+        value at the start of this run/resume (snapshotted in `on_fit_start`).
+        Runs on every checkpoint save (frequent enough to pinpoint drift close
+        to when it happened, cheap enough -- an integer fingerprint per tensor,
+        no cloning -- to not slow saves down materially). Raises loudly rather
+        than silently persisting a checkpoint with corrupted "frozen" weights
+        (see freeze_params).
+        """
+        fingerprints = getattr(self, "_frozen_param_fingerprints", None)
+        if not fingerprints:
+            return  # configure_optimizers() has not run yet (e.g. sanity-check pass before training).
+        drifted = verify_frozen_params_unchanged(self, fingerprints)
+        if drifted:
+            msg = (
+                f"Frozen-parameter integrity check FAILED before checkpoint save at "
+                f"global_step={self.trainer.global_step if self.trainer is not None else '?'}: "
+                f"{len(drifted)} parameter(s) that should be frozen (per model.freeze_params) "
+                f"have changed value since training started. Refusing to save -- this checkpoint's "
+                f"frozen submodules (e.g. speech_generation, llm, perception.encoder) can no "
+                f"longer be trusted to match their intended pretrained/frozen state."
+            )
+            if os.environ.get("FROZEN_PARAM_CHECK_NONFATAL", "0") == "1":
+                # DIAGNOSTIC-ONLY escape hatch: log the FULL drifted list and continue instead
+                # of raising, so a live repro run can keep going past the first checkpoint save.
+                logging.error(msg)
+                logging.error(f"[frozen-param-check] FULL drifted list ({len(drifted)}): {drifted}")
+            else:
+                raise RuntimeError(msg)
+
+    def on_before_optimizer_step(self, optimizer):
+        """Log gradient norms for ASR adapter and RNNT modules after each backward pass.
+
+        Gated on ``model.log_rnnt_grad_norms: true`` (default off) so pre-existing
+        experiments are byte-identical.  When enabled, logs once per step at the
+        INFO level so it appears in the NeMo log without flooding WandB/TensorBoard.
+        The check at step 0 is especially important: if any of these modules shows
+        grad_norm=0 after the first backward, the RNNT branch is not receiving
+        gradients.
+        """
+        if not self.cfg.get("log_rnnt_grad_norms", False):
+            return
+        modules_to_check = [
+            ("perception.asr_adapter", getattr(getattr(self, "perception", None), "asr_adapter", None)),
+            ("rnnt_decoder", getattr(self, "rnnt_decoder", None)),
+            ("rnnt_joint", getattr(self, "rnnt_joint", None)),
+            ("perception.encoder", getattr(getattr(self, "perception", None), "encoder", None)),
+            ("perception.modality_adapter", getattr(getattr(self, "perception", None), "modality_adapter", None)),
+        ]
+        step = self.trainer.global_step if self.trainer is not None else -1
+        # Log at step 0, 1, 2 (first few) then every 50 steps.
+        if step > 2 and step % 50 != 0:
+            return
+        parts = []
+        for tag, mod in modules_to_check:
+            if mod is None:
+                continue
+            grads = [p.grad for p in mod.parameters() if p.grad is not None]
+            if grads:
+                norm = sum(g.detach().float().norm() ** 2 for g in grads) ** 0.5
+                parts.append(f"{tag}={norm:.4e}")
+            else:
+                parts.append(f"{tag}=no_grad")
+        if parts:
+            logging.info("[step=%d] grad norms — %s", step, "  ".join(parts))
 
     @property
     def oomptimizer_schema(self) -> dict:
